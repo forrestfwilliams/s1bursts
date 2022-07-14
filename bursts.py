@@ -6,8 +6,18 @@ import xml.etree.ElementTree as ET
 import zipfile
 import fnmatch
 import pandas as pd
+import numpy as np
 import geopandas as gpd
 from shapely.geometry import Polygon
+from datetime import datetime, timedelta
+
+# These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
+# MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
+NOMINAL_ORBITAL_DURATION = timedelta(seconds=12 * 24 * 3600 / 175)
+PREAMBLE_LENGTH_IW = timedelta(seconds=2.299849)
+PREAMBLE_LENGTH_EW = timedelta(seconds=2.299970)
+BEAM_CYCLE_TIME_IW = timedelta(seconds=2.758273)
+BEAM_CYCLE_TIME_EW = timedelta(seconds=3.038376)
 
 
 def getxmlattr(xml_root, path, key):
@@ -66,7 +76,7 @@ def read_time(input_str, fmt="%Y-%m-%dT%H:%M:%S.%f"):
         dt: python's datetime object
     """
 
-    dt = datetime.datetime.strptime(input_str, fmt)
+    dt = datetime.strptime(input_str, fmt)
     return dt
 
 
@@ -128,8 +138,37 @@ def burstCoords(geocoords, lineperburst, idx):
     return poly, xc[0], yc[0]
 
 
-# @staticmethod
-# def get_relative_burst_id():
+# These formulas are from the abovementioned PDF, section 9.25
+def calc_burstid_from_timedist(timedist: timedelta, is_ew: bool = False) -> int:
+    prelen = PREAMBLE_LENGTH_EW if is_ew else PREAMBLE_LENGTH_IW
+    beamtime = BEAM_CYCLE_TIME_EW if is_ew else BEAM_CYCLE_TIME_IW
+    burstid = np.floor((timedist - prelen) / beamtime) + 1
+    return burstid
+
+
+def calc_timedistance(mid_burst_datetime: datetime, anx_datetime: datetime, orbit_number: int) -> timedelta:
+    orbital = (orbit_number - 1) * NOMINAL_ORBITAL_DURATION
+    time_distance = mid_burst_datetime - anx_datetime + orbital
+    return time_distance
+
+
+def calculate_relative_burst_id(mid_burst_time: str, anx_time: str, orbit_number: int, is_ew: bool = False) -> int:
+    """
+    Calculates the burst ID of a SLC granule based on the various inputs.
+    :param mid_burst_time: ISO date from annotation XML /product/swathTiming/burstList/burst/sensingTime
+    :param anx_time: ISO date, found in manifest.safe file <s1:ascendingNodeTime>
+    :param orbit_number: Can be either relative or absolute orbit number.
+                         From manifest.safe <safe:orbitNumber type="start"> or <safe:relativeOrbitNumber type="start">
+    :param is_ew: True if EW data, False if IW data
+    :return: Burst ID
+    """
+    mid_burst_datetime = datetime.fromisoformat(mid_burst_time)
+    anx_datetime = datetime.fromisoformat(anx_time)
+
+    time_distance = calc_timedistance(mid_burst_datetime, anx_datetime, orbit_number)
+
+    return calc_burstid_from_timedist(time_distance, is_ew)
+
 
 def update_burst_dataframe(df, zipname, swath, polarization):
     """
@@ -169,24 +208,11 @@ def update_burst_dataframe(df, zipname, swath, polarization):
         dt = read_time(sensingStart) - read_time(ascNodeTime)
         time_info = int((dt.seconds + dt.microseconds / 1e6) / burst_interval)
         burstID = "t" + str(trackNumber) + "s" + str(swath) + "b" + str(time_info)
+        relative_burst_id = calculate_relative_burst_id(sensingStart, ascNodeTime, orbitNumber, is_ew=False)
         thisBurstCoords, xc, yc = burstCoords(geocords, lineperburst, index)
-        # check if self.df has this dt for this track. If not append it
-
-        burst_query = self.df.query("burst_ID=='{}'".format(burstID))
-        if burst_query.empty:
-            print("adding {} to the dataframe".format(burstID))
-
-            self.df = pd.concat([self.df, pd.DataFrame.from_records([{'burst_ID': burstID,
-                                                                      'pass_direction': passtype,
-                                                                      'longitude': xc,
-                                                                      'latitude': yc,
-                                                                      'geometry': thisBurstCoords.wkt
-                                                                      }])])
-
-        else:
-            print('The Unique ID {} already exists.'.format(burstID))
 
         df = pd.concat([df, pd.DataFrame.from_records([{'burst_ID': burstID,
+                                                        'relativeID': relative_burst_id,
                                                         'swath': swath,
                                                         'polarization': polarization,
                                                         'date': read_time(
@@ -204,4 +230,9 @@ def update_burst_dataframe(df, zipname, swath, polarization):
                                                         }])])
 
     zf.close()
-    return df
+    return df.drop_duplicates().reset_index()
+
+
+def generate_stac_collection():
+    pass
+    return None

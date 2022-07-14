@@ -142,7 +142,7 @@ def burstCoords(geocoords, lineperburst, idx):
 def calc_burstid_from_timedist(timedist: timedelta, is_ew: bool = False) -> int:
     prelen = PREAMBLE_LENGTH_EW if is_ew else PREAMBLE_LENGTH_IW
     beamtime = BEAM_CYCLE_TIME_EW if is_ew else BEAM_CYCLE_TIME_IW
-    burstid = np.floor((timedist - prelen) / beamtime) + 1
+    burstid = 1 + np.floor((timedist - prelen) / beamtime)
     return burstid
 
 
@@ -166,8 +166,9 @@ def calculate_relative_burst_id(mid_burst_time: str, anx_time: str, orbit_number
     anx_datetime = datetime.fromisoformat(anx_time)
 
     time_distance = calc_timedistance(mid_burst_datetime, anx_datetime, orbit_number)
-
-    return calc_burstid_from_timedist(time_distance, is_ew)
+    burst_id = calc_burstid_from_timedist(time_distance, is_ew)
+    # FIXME burst_id is off by one
+    return int(burst_id) + 1
 
 
 def update_burst_dataframe(df, zipname, swath, polarization):
@@ -208,7 +209,7 @@ def update_burst_dataframe(df, zipname, swath, polarization):
         dt = read_time(sensingStart) - read_time(ascNodeTime)
         time_info = int((dt.seconds + dt.microseconds / 1e6) / burst_interval)
         burstID = "t" + str(trackNumber) + "s" + str(swath) + "b" + str(time_info)
-        relative_burst_id = calculate_relative_burst_id(sensingStart, ascNodeTime, orbitNumber, is_ew=False)
+        relative_burst_id = calculate_relative_burst_id(sensingStart, ascNodeTime, trackNumber, is_ew=False)
         thisBurstCoords, xc, yc = burstCoords(geocords, lineperburst, index)
 
         df = pd.concat([df, pd.DataFrame.from_records([{'burst_ID': burstID,
@@ -230,7 +231,7 @@ def update_burst_dataframe(df, zipname, swath, polarization):
                                                         }])])
 
     zf.close()
-    return df.drop_duplicates().reset_index()
+    return df.drop_duplicates().reset_index(drop=True)
 
 
 def generate_stac_collection():

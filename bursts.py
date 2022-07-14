@@ -1,15 +1,17 @@
+import datetime
+import fnmatch
 import json
 import os
-import datetime
-import xml
 import xml.etree.ElementTree as ET
 import zipfile
-import fnmatch
-import pandas as pd
-import numpy as np
-import geopandas as gpd
-from shapely.geometry import Polygon
 from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pystac
+import shapely
+from shapely.geometry import Polygon
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
@@ -238,6 +240,33 @@ def update_burst_dataframe(df, zipname, swath, polarization):
     return df.drop_duplicates().reset_index(drop=True)
 
 
-def generate_stac_collection():
-    pass
-    return None
+def generate_stac_catalog(df):
+    catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
+
+    for i, row in df.iterrows():
+        footprint = shapely.wkt.loads(row['geometry'])
+        bbox = footprint.bounds
+        timestamp = datetime.strptime(row['date'], "%Y%m%dT%H%M%S")
+        location = {'byte_offset': row['byte_offset'], 'byte_length': row['byte_length']}
+
+        item = pystac.Item(id=row['absoluteID'],
+                           geometry=shapely.geometry.mapping(footprint),
+                           bbox=bbox,
+                           datetime=timestamp,
+                           properties={})
+        item.add_asset(key=row['polarization'].upper(),
+                       asset=pystac.Asset(href=row['measurement'], media_type=pystac.MediaType.GEOTIFF,
+                                          extra_fields=location))
+        catalog.add_item(item)
+
+    return catalog
+
+
+def save_stac_catalog_locally(catalog):
+    stac_location = Path('.') / 'stac'
+    if not stac_location.exists():
+        stac_location.mkdir()
+    catalog.normalize_hrefs(str(stac_location))
+    catalog.make_all_asset_hrefs_relative()
+    catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+    return stac_location / 'catalog.json'

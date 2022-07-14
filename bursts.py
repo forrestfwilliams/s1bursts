@@ -5,13 +5,13 @@ import os
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timedelta
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pystac
-import shapely
-from shapely.geometry import Polygon
+from shapely import geometry, wkt
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
@@ -135,7 +135,7 @@ def burstCoords(geocoords, lineperburst, idx):
     Y2.reverse()
     X = X1 + X2
     Y = Y1 + Y2
-    poly = Polygon(zip(X, Y))
+    poly = geometry.Polygon(zip(X, Y))
     xc, yc = poly.centroid.xy
     return poly, xc[0], yc[0]
 
@@ -244,13 +244,13 @@ def generate_stac_catalog(df):
     catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
 
     for i, row in df.iterrows():
-        footprint = shapely.wkt.loads(row['geometry'])
+        footprint = wkt.loads(row['geometry'])
         bbox = footprint.bounds
         timestamp = datetime.strptime(row['date'], "%Y%m%dT%H%M%S")
         location = {'byte_offset': row['byte_offset'], 'byte_length': row['byte_length']}
 
         item = pystac.Item(id=row['absoluteID'],
-                           geometry=shapely.geometry.mapping(footprint),
+                           geometry=geometry.mapping(footprint),
                            bbox=bbox,
                            datetime=timestamp,
                            properties={})
@@ -270,3 +270,22 @@ def save_stac_catalog_locally(catalog):
     catalog.make_all_asset_hrefs_relative()
     catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
     return stac_location / 'catalog.json'
+
+
+class CORSRequestHandler(SimpleHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET')
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        return super(CORSRequestHandler, self).end_headers()
+
+
+def initiate_stac_catalog_server(port, catalog_dir):
+    port = port
+    os.chdir(catalog_dir.resolve().__str__())
+    url = f'http://localhost:{port}/catalog.json'
+    print(f'{url}\n', 'In stac-browser run:\n', f'npm start -- --open --CATALOG_URL="{url}" ')
+
+    with HTTPServer(('localhost', port), CORSRequestHandler) as httpd:
+        httpd.serve_forever()
+

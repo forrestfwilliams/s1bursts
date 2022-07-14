@@ -205,30 +205,34 @@ def update_burst_dataframe(df, zipname, swath, polarization):
     geocords, tiff_path = getCoordinates(zipname, swath, polarization)
     for index, burst in enumerate(list(burstList)):
         sensingStart = burst.find('azimuthTime').text
+        date = read_time(sensingStart).strftime("%Y%m%dT%H%M%S")
         byte_offset = int(burst.find('byteOffset').text)
         dt = read_time(sensingStart) - read_time(ascNodeTime)
         time_info = int((dt.seconds + dt.microseconds / 1e6) / burst_interval)
-        burstID = "t" + str(trackNumber) + "s" + str(swath) + "b" + str(time_info)
         relative_burst_id = calculate_relative_burst_id(sensingStart, ascNodeTime, trackNumber, is_ew=False)
+        absolute_burst_id = f'S1_SLC_{date}_{polarization.upper()}_{relative_burst_id}_IW{swath}'
         thisBurstCoords, xc, yc = burstCoords(geocords, lineperburst, index)
 
-        df = pd.concat([df, pd.DataFrame.from_records([{'burst_ID': burstID,
+        df = pd.concat([df, pd.DataFrame.from_records([{'absoluteID': absolute_burst_id,
                                                         'relativeID': relative_burst_id,
                                                         'swath': swath,
                                                         'polarization': polarization,
-                                                        'date': read_time(
-                                                            sensingStart).strftime(
-                                                            "%Y%m%dT%H%M%S"),
+                                                        'date': date,
                                                         'pass_direction': passtype,
                                                         'annotation': annotation_path,
                                                         'measurement': tiff_path,
                                                         'longitude': xc,
                                                         'latitude': yc,
                                                         'geometry': thisBurstCoords.wkt,
-                                                        'byte_offset': byte_offset,
                                                         'lines': lineperburst,
                                                         'samples': sampleperburst,
+                                                        'byte_offset': byte_offset,
                                                         }])])
+    lengths = df['byte_offset'].rolling(2).apply(lambda x: x.iloc[1] - x.iloc[0]).iloc[1:]
+    length = lengths.drop_duplicates()
+    if length.shape[0] > 1:
+        raise ValueError('Bursts have differing byte lengths')
+    df['byte_length'] = int(length.iloc[0])
 
     zf.close()
     return df.drop_duplicates().reset_index(drop=True)

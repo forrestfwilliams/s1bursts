@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
+import fsspec
 import numpy as np
 import pandas as pd
 import pystac
@@ -247,16 +248,16 @@ def generate_stac_catalog(df):
         footprint = wkt.loads(row['geometry'])
         bbox = footprint.bounds
         timestamp = datetime.strptime(row['date'], "%Y%m%dT%H%M%S")
-        location = {'byte_offset': row['byte_offset'], 'byte_length': row['byte_length']}
+        location = {'lines': row['lines'], 'samples': row['samples'], 'byte_offset': row['byte_offset'],
+                    'byte_length': row['byte_length']}
 
         item = pystac.Item(id=row['absoluteID'],
                            geometry=geometry.mapping(footprint),
                            bbox=bbox,
                            datetime=timestamp,
-                           properties={})
+                           properties=location)
         item.add_asset(key=row['polarization'].upper(),
-                       asset=pystac.Asset(href=row['measurement'], media_type=pystac.MediaType.GEOTIFF,
-                                          extra_fields=location))
+                       asset=pystac.Asset(href=row['measurement'], media_type=pystac.MediaType.GEOTIFF))
         catalog.add_item(item)
 
     return catalog
@@ -289,3 +290,19 @@ def initiate_stac_catalog_server(port, catalog_dir):
     with HTTPServer(('localhost', port), CORSRequestHandler) as httpd:
         httpd.serve_forever()
 
+
+def read_local_burst(item, polarization='VV'):
+    href = item.get_assets()[polarization].href
+    safe, folder, tif = Path(href).parts
+    safe = safe.replace('SAFE', 'zip')
+    data_path = f'zip://*/{folder}/{tif}::./{safe}'
+
+    with fsspec.open(data_path) as f:
+        byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
+                                              length=item.properties['byte_length'])
+
+    arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
+    fs_burst = arr.copy()
+    fs_burst.dtype = 'complex'
+    fs_burst = fs_burst.reshape((item.properties['lines'], item.properties['samples']))
+    return fs_burst

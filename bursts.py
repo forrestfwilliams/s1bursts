@@ -32,8 +32,9 @@ def fsspec_load_safe_json(slc, interior_path):
     return xml.getroot()
 
 
-class SafeMetadata:
+class SLCMetadata:
     def __init__(self, slc_path):
+        self.safe_name = Path(slc_path).name
         self.manifest = fsspec_load_safe_json(slc_path, 'manifest.safe')
 
         self.file_paths = [x.attrib['href'] for x in self.manifest.findall('.//fileLocation')]
@@ -50,16 +51,17 @@ class SafeMetadata:
 
 
 class SwathMetadata:
-    def __init__(self, safe, polarization, swath_index):
+    def __init__(self, slc, polarization, swath_index):
+        self.safe_name = slc.safe_name
         self.polarization = polarization
         self.swath_index = swath_index
-        self.annotation_path = [x for x in safe.annotation_paths if self.polarization.lower() in x][self.swath_index]
-        self.measurement_path = [x for x in safe.measurement_paths if self.polarization.lower() in x][self.swath_index]
-        annotation_index = safe.annotation_paths.index(self.annotation_path)
+        self.annotation_path = [x for x in slc.annotation_paths if self.polarization.lower() in x][self.swath_index]
+        self.measurement_path = [x for x in slc.measurement_paths if self.polarization.lower() in x][self.swath_index]
+        annotation_index = slc.annotation_paths.index(self.annotation_path)
 
-        self.annotation = safe.annotations[annotation_index]
-        self.relative_orbit = safe.relative_orbit
-        self.slc_anx_time = safe.anx_time
+        self.annotation = slc.annotations[annotation_index]
+        self.relative_orbit = slc.relative_orbit
+        self.slc_anx_time = slc.anx_time
 
         self.n_bursts = int(self.annotation.find('.//{*}burstList').attrib['count'])
         self.gcp_df = self.create_gcp_df()
@@ -81,6 +83,7 @@ class SwathMetadata:
 
 class BurstMetadata:
     def __init__(self, swath, burst_index):
+        self.safe_name = swath.safe_name
         self.polarization = swath.polarization
         self.swath_index = swath.swath_index
         self.burst_index = burst_index
@@ -103,7 +106,7 @@ class BurstMetadata:
 
         self.relative_burst_id = self.calculate_relative_burstid()
         self.stack_id = f'{self.relative_burst_id}_IW{self.swath_index + 1}'
-        self.footprint = self.create_footprint(swath.gcp_df)
+        self.footprint, self.bounds = self.create_footprint(swath.gcp_df)
         self.absolute_burst_id = f'S1_SLC_{self.datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
 
     def reformat_datetime(self):
@@ -131,43 +134,42 @@ class BurstMetadata:
         x = x1 + x2
         y = y1 + y2
         poly = geometry.Polygon(zip(x, y))
-        return poly
+        return str(poly), poly.bounds
 
     def to_series(self):
-        attribs = ['absolute_burst_id', 'relative_burst_id', 'datetime', 'polygon']
+        attribs = ['absolute_burst_id', 'relative_burst_id', 'datetime', 'footprint']
         attrib_dict = {k: getattr(self, k) for k in attribs}
         return pd.Series(attrib_dict)
 
     def to_stac_item(self):
+        properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
+                      'byte_length': self.byte_length, 'stack_id': self.stack_id}
+        href = f'{self.safe_name}/{self.measurement_path}'
         item = pystac.Item(id=self.absolute_burst_id,
                            geometry=self.footprint,
-                           bbox=self.footprint.bounds,
+                           bbox=self.bounds,
                            datetime=datetime.strptime(self.datetime, "%Y%m%dT%H%M%S"),
-                           properties={'stack_id': self.stack_id})
+                           properties=properties)
 
         item.add_asset(key=self.polarization.upper(),
-                       asset=pystac.Asset(href=self.measurement_path, media_type=pystac.MediaType.GEOTIFF))
+                       asset=pystac.Asset(href=href, media_type=pystac.MediaType.GEOTIFF))
         return item
 
 
-def generate_stac_catalog(df):
+def generate_stac_catalog(safe_list):
     catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
+    stac_item_list = []
 
-    for i, row in df.iterrows():
-        footprint = wkt.loads(row['geometry'])
-        bbox = footprint.bounds
-        timestamp = datetime.strptime(row['date'], "%Y%m%dT%H%M%S")
-        location = {'lines': row['lines'], 'samples': row['samples'], 'byte_offset': row['byte_offset'],
-                    'byte_length': row['byte_length']}
+    for safe_path in safe_list:
+        slc = SLCMetadata(safe_path)
+        for swath_index in range(0, slc.n_swaths):
+            swath = SwathMetadata(slc, 'vv', swath_index)
+            for burst_index in range(0, swath.n_bursts):
+                burst = BurstMetadata(swath, burst_index)
 
-        item = pystac.Item(id=row['absoluteID'],
-                           geometry=geometry.mapping(footprint),
-                           bbox=bbox,
-                           datetime=timestamp,
-                           properties=location)
-        item.add_asset(key=row['polarization'].upper(),
-                       asset=pystac.Asset(href=row['measurement'], media_type=pystac.MediaType.GEOTIFF))
-        catalog.add_item(item)
+                stac_item_list.append(burst.to_stac_item())
+
+    catalog.add_items(stac_item_list)
 
     return catalog
 

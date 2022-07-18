@@ -1,4 +1,3 @@
-import datetime
 import fnmatch
 import json
 import os
@@ -9,6 +8,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 import fsspec
+import re
 import numpy as np
 import pandas as pd
 import pystac
@@ -16,229 +16,138 @@ from shapely import geometry, wkt
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
-NOMINAL_ORBITAL_DURATION = timedelta(seconds=12 * 24 * 3600 / 175)
-PREAMBLE_LENGTH_IW = timedelta(seconds=2.299849)
-PREAMBLE_LENGTH_EW = timedelta(seconds=2.299970)
-BEAM_CYCLE_TIME_IW = timedelta(seconds=2.758273)
-BEAM_CYCLE_TIME_EW = timedelta(seconds=3.038376)
+NOMINAL_ORBITAL_DURATION = 12 * 24 * 3600 / 175
+PREAMBLE_LENGTH = 2.299849
+BEAM_CYCLE_TIME = 2.758273
 
 
-def getxmlattr(xml_root, path, key):
-    """
-    Function to extract the attribute of an xml key
-    """
-
-    try:
-        res = xml_root.find(path).attrib[key]
-    except:
-        raise Exception('Cannot find attribute %s at %s' % (key, path))
-
-    return res
+def generate_path(safe, interior_path, protocol='zip://'):
+    path = f'{protocol}*/{interior_path}::{safe}'
+    return path
 
 
-def getxmlvalue(xml_root, path):
-    """
-    Function to extract value in the xml for a given path
-    """
-
-    try:
-        res = xml_root.find(path).text
-    except:
-        raise Exception('Tag= %s not found' % (path))
-
-    if res is None:
-        raise Exception('Tag = %s not found' % (path))
-
-    return res
+def fsspec_load_safe_json(slc, interior_path):
+    with fsspec.open(generate_path(slc, interior_path), 'r') as f:
+        xml = ET.parse(f)
+    return xml.getroot()
 
 
-def getxmlelement(xml_root, path):
-    """
-    extract an element of a xml file
-    """
+class SafeMetadata:
+    def __init__(self, slc_path):
+        self.manifest = fsspec_load_safe_json(slc_path, 'manifest.safe')
 
-    try:
-        res = xml_root.find(path)
-    except:
-        raise Exception('Cannot find path %s' % (path))
+        self.file_paths = [x.attrib['href'] for x in self.manifest.findall('.//fileLocation')]
+        self.relative_orbit = int(self.manifest.findall('.//{*}relativeOrbitNumber')[0].text)
+        self.anx_time = float(self.manifest.find('.//{*}startTimeANX').text)
+        self.n_swaths = len(self.manifest.findall('.//{*}swath'))
 
-    if res is None:
-        raise Exception('Cannot find path %s' % (path))
+        self.annotation_paths = [x[2:] for x in self.file_paths if re.search('^\./annotation/s1.*xml$', x)]
+        self.annotation_paths.sort()
+        self.annotations = [fsspec_load_safe_json(slc_path, x) for x in self.annotation_paths]
 
-    return res
-
-
-def read_time(input_str, fmt="%Y-%m-%dT%H:%M:%S.%f"):
-    """
-    The function to convert a string to a datetime object
-    Parameters:
-        input_str: A string which contains the data time with the format of fmt
-        fmt: the format of input_str
-
-    Returns:
-        dt: python's datetime object
-    """
-
-    dt = datetime.strptime(input_str, fmt)
-    return dt
+        self.measurement_paths = [x[2:] for x in self.file_paths if re.search('^\./measurement/s1.*tiff$', x)]
+        self.measurement_paths.sort()
 
 
-def getCoordinates(zipname, swath, polarization):
-    """
-    The function to extract the Ground Control Points (GCP) of bursts from tiff file.
+class SwathMetadata:
+    def __init__(self, safe, polarization, swath_index):
+        self.polarization = polarization
+        self.swath_index = swath_index
+        self.annotation_path = [x for x in safe.annotation_paths if self.polarization.lower() in x][self.swath_index]
+        self.measurement_path = [x for x in safe.measurement_paths if self.polarization.lower() in x][self.swath_index]
+        annotation_index = safe.annotation_paths.index(self.annotation_path)
 
-    Parameters:
-        zipname: the name of the zipfile which contains the data
+        self.annotation = safe.annotations[annotation_index]
+        self.relative_orbit = safe.relative_orbit
+        self.slc_anx_time = safe.anx_time
 
-    Returns:
-        df_coordinates: A pandas dataframe of GCPs
-    """
+        self.n_bursts = int(self.annotation.find('.//{*}burstList').attrib['count'])
+        self.gcp_df = self.create_gcp_df()
 
-    zf = zipfile.ZipFile(zipname, 'r')
+    @staticmethod
+    def reformat_gcp(point):
+        attribs = ['line', 'pixel', 'latitude', 'longitude', 'height']
+        values = {}
+        for attrib in attribs:
+            values[attrib] = float(point.find(attrib).text)
+        return values
 
-    tiffpath = os.path.join('*SAFE', 'measurement', 's1[ab]-iw{}-slc-{}*tiff'.format(swath, polarization))
-    match = fnmatch.filter(zf.namelist(), tiffpath)
-    zf.close()
-
-    tiffname = os.path.join('/vsizip/' + zipname, match[0])
-    cmd = "gdalinfo -json {} >> info.json".format(tiffname)
-    os.system(cmd)
-    with open("info.json", 'r') as fid:
-        info = json.load(fid)
-
-    df_coordinates = pd.DataFrame(info['gcps']['gcpList'])
-    os.system('rm info.json')
-    return df_coordinates, match[0]
-
-
-def burstCoords(geocoords, lineperburst, idx):
-    """
-    The function to extract coordinates for a given burst.
-
-    Parameters:
-        geocoords: A pandas dataframe of GCPs
-        lineperburst: number of lines in each burst
-        idx: index of the burst of interest
-
-    Returns:
-        poly: a shapely polygon represnting the boundary of the burst
-        xc: longitude of the centroid of the polygon
-        yc: latitude of the centroid of the polygon
-    """
-
-    firstLine = geocoords.loc[geocoords['line'] == idx * lineperburst].filter(['x', 'y'])
-    secondLine = geocoords.loc[geocoords['line'] == (idx + 1) * lineperburst].filter(['x', 'y'])
-    X1 = firstLine['x'].tolist()
-    Y1 = firstLine['y'].tolist()
-    X2 = secondLine['x'].tolist()
-    Y2 = secondLine['y'].tolist()
-    X2.reverse()
-    Y2.reverse()
-    X = X1 + X2
-    Y = Y1 + Y2
-    poly = geometry.Polygon(zip(X, Y))
-    xc, yc = poly.centroid.xy
-    return poly, xc[0], yc[0]
+    def create_gcp_df(self):
+        points = self.annotation.findall('.//{*}geolocationGridPoint')
+        gcp_df = pd.DataFrame([self.reformat_gcp(x) for x in points])
+        gcp_df = gcp_df.sort_values(['line', 'pixel']).reset_index(drop=True)
+        return gcp_df
 
 
-# These formulas are from the abovementioned PDF, section 9.25
-def calc_burstid_from_timedist(timedist: timedelta, is_ew: bool = False) -> int:
-    prelen = PREAMBLE_LENGTH_EW if is_ew else PREAMBLE_LENGTH_IW
-    beamtime = BEAM_CYCLE_TIME_EW if is_ew else BEAM_CYCLE_TIME_IW
-    burstid = 1 + np.floor((timedist - prelen) / beamtime)
-    return burstid
+class BurstMetadata:
+    def __init__(self, swath, burst_index):
+        self.polarization = swath.polarization
+        self.swath_index = swath.swath_index
+        self.burst_index = burst_index
+        self.annotation_path = swath.annotation_path
+        self.measurement_path = swath.measurement_path
+        self.relative_orbit = swath.relative_orbit
+        self.slc_anx_time = swath.slc_anx_time
 
+        burst_annotations = swath.annotation.findall('.//{*}burst')
+        byte_offset0 = int(burst_annotations[0].find('.//{*}byteOffset').text)
+        byte_offset1 = int(burst_annotations[1].find('.//{*}byteOffset').text)
+        self.burst_annotation = burst_annotations[burst_index]
+        self.byte_offset = int(self.burst_annotation.find('.//{*}byteOffset').text)
+        self.byte_length = byte_offset1 - byte_offset0
 
-def calc_timedistance(mid_burst_datetime: datetime, anx_datetime: datetime, orbit_number: int) -> timedelta:
-    orbital = (orbit_number - 1) * NOMINAL_ORBITAL_DURATION
-    time_distance = mid_burst_datetime - anx_datetime + orbital
-    return time_distance
+        self.lines = int(swath.annotation.find('.//{*}linesPerBurst').text)
+        self.samples = int(swath.annotation.find('.//{*}samplesPerBurst').text)
+        self.burst_anx_time = float(self.burst_annotation.find('.//{*}azimuthAnxTime').text)
+        self.datetime = self.reformat_datetime()
 
+        self.relative_burst_id = self.calculate_relative_burstid()
+        self.stack_id = f'{self.relative_burst_id}_IW{self.swath_index + 1}'
+        self.footprint = self.create_footprint(swath.gcp_df)
+        self.absolute_burst_id = f'S1_SLC_{self.datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
 
-def calculate_relative_burst_id(mid_burst_time: str, anx_time: str, orbit_number: int, is_ew: bool = False) -> int:
-    """
-    Calculates the burst ID of a SLC granule based on the various inputs.
-    :param mid_burst_time: ISO date from annotation XML /product/swathTiming/burstList/burst/sensingTime
-    :param anx_time: ISO date, found in manifest.safe file <s1:ascendingNodeTime>
-    :param orbit_number: Can be either relative or absolute orbit number.
-                         From manifest.safe <safe:orbitNumber type="start"> or <safe:relativeOrbitNumber type="start">
-    :param is_ew: True if EW data, False if IW data
-    :return: Burst ID
-    """
-    mid_burst_datetime = datetime.fromisoformat(mid_burst_time)
-    anx_datetime = datetime.fromisoformat(anx_time)
+    def reformat_datetime(self):
+        in_format = '%Y-%m-%dT%H:%M:%S.%f'
+        out_format = '%Y%m%dT%H%M%S'
+        dt = datetime.strptime(self.burst_annotation.find('.//{*}sensingTime').text, in_format)
+        return dt.strftime(out_format)
 
-    time_distance = calc_timedistance(mid_burst_datetime, anx_datetime, orbit_number)
-    burst_id = calc_burstid_from_timedist(time_distance, is_ew)
-    # FIXME burst_id is off by one
-    return int(burst_id) + 1
+    def calculate_relative_burstid(self):
+        orbital = (self.relative_orbit - 1) * NOMINAL_ORBITAL_DURATION
+        time_distance = self.burst_anx_time + orbital
+        relative_burstid = 1 + np.floor((time_distance - PREAMBLE_LENGTH) / BEAM_CYCLE_TIME)
+        # FIXME relative_burst_id is off by one
+        return int(relative_burstid) + 1
 
+    def create_footprint(self, gcp_df):
+        first_line = gcp_df.loc[gcp_df['line'] == self.burst_index * self.lines, ['longitude', 'latitude']]
+        second_line = gcp_df.loc[gcp_df['line'] == (self.burst_index + 1) * self.lines, ['longitude', 'latitude']]
+        x1 = first_line['longitude'].tolist()
+        y1 = first_line['latitude'].tolist()
+        x2 = second_line['longitude'].tolist()
+        y2 = second_line['latitude'].tolist()
+        x2.reverse()
+        y2.reverse()
+        x = x1 + x2
+        y = y1 + y2
+        poly = geometry.Polygon(zip(x, y))
+        return poly
 
-def update_burst_dataframe(df, zipname, swath, polarization):
-    """
-    The function to update the dataframes
-    Parameters:
-        zipname: the zip file which contains the satellite data
-        swath: the swath of the slc file to extract bursts info from
-        polarization: the polarization of the slc file to extract bursts info from
-    """
+    def to_series(self):
+        attribs = ['absolute_burst_id', 'relative_burst_id', 'datetime', 'polygon']
+        attrib_dict = {k: getattr(self, k) for k in attribs}
+        return pd.Series(attrib_dict)
 
-    zf = zipfile.ZipFile(zipname, 'r')
-    xmlpath = os.path.join('*SAFE', 'annotation', 's1[ab]-iw{}-slc-{}*xml'.format(swath, polarization))
-    match = fnmatch.filter(zf.namelist(), xmlpath)
-    xmlstr = zf.read(match[0])
-    annotation_path = match[0]
-    xml_root = ET.fromstring(xmlstr)
-    # Burst interval
-    burst_interval = 2.758277
+    def to_stac_item(self):
+        item = pystac.Item(id=self.absolute_burst_id,
+                           geometry=self.footprint,
+                           bbox=self.footprint.bounds,
+                           datetime=datetime.strptime(self.datetime, "%Y%m%dT%H%M%S"),
+                           properties={'stack_id': self.stack_id})
 
-    ascNodeTime = getxmlvalue(xml_root, "imageAnnotation/imageInformation/ascendingNodeTime")
-    numBursts = getxmlattr(xml_root, 'swathTiming/burstList', 'count')
-    burstList = getxmlelement(xml_root, 'swathTiming/burstList')
-    passtype = getxmlvalue(xml_root, 'generalAnnotation/productInformation/pass')
-    orbitNumber = int(getxmlvalue(xml_root, 'adsHeader/absoluteOrbitNumber'))
-    # relative orbit number
-    # link: https://forum.step.esa.int/t/sentinel-1-relative-orbit-from-filename/7042/20
-    if os.path.basename(zipname).lower().startswith('s1a'):
-        trackNumber = (orbitNumber - 73) % 175 + 1
-    else:
-        trackNumber = (orbitNumber - 27) % 175 + 1
-    lineperburst = int(getxmlvalue(xml_root, 'swathTiming/linesPerBurst'))
-    sampleperburst = int(getxmlvalue(xml_root, 'swathTiming/samplesPerBurst'))
-    geocords, tiff_path = getCoordinates(zipname, swath, polarization)
-    for index, burst in enumerate(list(burstList)):
-        sensingStart = burst.find('azimuthTime').text
-        date = read_time(sensingStart).strftime("%Y%m%dT%H%M%S")
-        byte_offset = int(burst.find('byteOffset').text)
-        dt = read_time(sensingStart) - read_time(ascNodeTime)
-        time_info = int((dt.seconds + dt.microseconds / 1e6) / burst_interval)
-        relative_burst_id = calculate_relative_burst_id(sensingStart, ascNodeTime, trackNumber, is_ew=False)
-        absolute_burst_id = f'S1_SLC_{date}_{polarization.upper()}_{relative_burst_id}_IW{swath}'
-        thisBurstCoords, xc, yc = burstCoords(geocords, lineperburst, index)
-
-        df = pd.concat([df, pd.DataFrame.from_records([{'absoluteID': absolute_burst_id,
-                                                        'relativeID': relative_burst_id,
-                                                        'swath': swath,
-                                                        'polarization': polarization,
-                                                        'date': date,
-                                                        'pass_direction': passtype,
-                                                        'annotation': annotation_path,
-                                                        'measurement': tiff_path,
-                                                        'longitude': xc,
-                                                        'latitude': yc,
-                                                        'geometry': thisBurstCoords.wkt,
-                                                        'lines': lineperburst,
-                                                        'samples': sampleperburst,
-                                                        'byte_offset': byte_offset,
-                                                        }])])
-    lengths = df['byte_offset'].rolling(2).apply(lambda x: x.iloc[1] - x.iloc[0]).iloc[1:]
-    length = lengths.drop_duplicates()
-    if length.shape[0] > 1:
-        raise ValueError('Bursts have differing byte lengths')
-    df['byte_length'] = int(length.iloc[0])
-
-    zf.close()
-    return df.drop_duplicates().reset_index(drop=True)
+        item.add_asset(key=self.polarization.upper(),
+                       asset=pystac.Asset(href=self.measurement_path, media_type=pystac.MediaType.GEOTIFF))
+        return item
 
 
 def generate_stac_catalog(df):

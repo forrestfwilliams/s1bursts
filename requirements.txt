@@ -1,2 +1,7 @@
 geopandas
+pandas
+numpy
+pystac
 fsspec
+aiohttp
+safe-netrc

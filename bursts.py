@@ -1,17 +1,17 @@
 import os
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from pathlib import Path
-import aiohttp
-from netrc import netrc
-
-import fsspec
 import re
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from netrc import netrc
+from pathlib import Path
+
+import aiohttp
+import fsspec
 import numpy as np
 import pandas as pd
 import pystac
-from shapely import geometry, wkt
+from shapely import geometry
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
@@ -47,12 +47,12 @@ class SLCMetadata:
         self.measurement_paths.sort()
 
         self.relative_orbit = int(self.manifest.findall('.//{*}relativeOrbitNumber')[0].text)
-        self.anx_time = float(self.manifest.find('.//{*}startTimeANX').text)
+        self.slc_anx_time = float(self.manifest.find('.//{*}startTimeANX').text)
         self.n_swaths = len(self.manifest.findall('.//{*}swath'))
 
     @staticmethod
     def download_safe_xml(zip_fs, safe_url, interior_path):
-        with zip_fs.open(create_safe_path(safe_url, 'manifest.safe')) as f:
+        with zip_fs.open(create_safe_path(safe_url, interior_path)) as f:
             xml = ET.parse(f)
         return xml.getroot()
 
@@ -79,16 +79,18 @@ class SLCMetadata:
 
 class SwathMetadata:
     def __init__(self, slc, polarization, swath_index):
+        self.safe_url = slc.safe_url
         self.safe_name = slc.safe_name
+        self.relative_orbit = slc.relative_orbit
+        self.slc_anx_time = slc.slc_anx_time
+
         self.polarization = polarization
         self.swath_index = swath_index
         self.annotation_path = [x for x in slc.annotation_paths if self.polarization.lower() in x][self.swath_index]
         self.measurement_path = [x for x in slc.measurement_paths if self.polarization.lower() in x][self.swath_index]
-        annotation_index = slc.annotation_paths.index(self.annotation_path)
 
+        annotation_index = slc.annotation_paths.index(self.annotation_path)
         self.annotation = slc.annotations[annotation_index]
-        self.relative_orbit = slc.relative_orbit
-        self.slc_anx_time = slc.anx_time
 
         self.n_bursts = int(self.annotation.find('.//{*}burstList').attrib['count'])
         self.gcp_df = self.create_gcp_df()
@@ -110,6 +112,7 @@ class SwathMetadata:
 
 class BurstMetadata:
     def __init__(self, swath, burst_index):
+        self.safe_url = swath.safe_url
         self.safe_name = swath.safe_name
         self.polarization = swath.polarization
         self.swath_index = swath.swath_index
@@ -170,7 +173,7 @@ class BurstMetadata:
 
     def to_stac_item(self):
         properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
-                      'byte_length': self.byte_length, 'stack_id': self.stack_id}
+                      'byte_length': self.byte_length, 'stack_id': self.stack_id, 'safe_url': self.safe_url}
         href = f'{self.safe_name}/{self.measurement_path}'
         item = pystac.Item(id=self.absolute_burst_id,
                            geometry=self.footprint,
@@ -183,12 +186,12 @@ class BurstMetadata:
         return item
 
 
-def generate_stac_catalog(safe_list):
+def generate_stac_catalog(safe_url_list):
     catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
     stac_item_list = []
 
-    for safe_path in safe_list:
-        slc = SLCMetadata(safe_path)
+    for safe_url in safe_url_list:
+        slc = SLCMetadata(safe_url)
         for swath_index in range(0, slc.n_swaths):
             swath = SwathMetadata(slc, 'vv', swath_index)
             for burst_index in range(0, swath.n_bursts):
@@ -244,3 +247,25 @@ def read_local_burst(item, polarization='VV'):
     fs_burst.dtype = 'complex'
     fs_burst = fs_burst.reshape((item.properties['lines'], item.properties['samples']))
     return fs_burst
+
+
+def edl_download_burst_data(item, polarization='VV'):
+    my_netrc = netrc()
+    username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
+    auth = aiohttp.BasicAuth(username, password)
+
+    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
+
+    fs = fsspec.filesystem('https', **storage_options['https'])
+    with fs.open(item.properties['safe_url']) as fo:
+        safe = fsspec.filesystem('zip', fo=fo)
+
+        with safe.open(item.assets[polarization.upper()].href) as f:
+            byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
+                                                  length=item.properties['byte_length'])
+
+    arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
+    burst_array = arr.copy()
+    burst_array.dtype = 'complex'
+    burst_array = burst_array.reshape((item.properties['lines'], item.properties['samples']))
+    return burst_array

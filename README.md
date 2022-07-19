@@ -7,3 +7,5 @@ A workflow for searching and accessing bursts that borrows heavily from the JPL 
 3. Turn a list of `BurstMetadata` objects into a STAC catalog
 4. Filter on catalog
 5. Request data present in filtered catalog over EDL HTTPS connection and return numpy arrays
+
+Check out the `example.ipynb` notebook to try out the workflow.

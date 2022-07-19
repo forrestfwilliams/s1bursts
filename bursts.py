@@ -10,8 +10,9 @@ import aiohttp
 import fsspec
 import numpy as np
 import pandas as pd
+import geopandas as gpd
 import pystac
-from shapely import geometry
+from shapely import geometry, wkt
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
@@ -186,7 +187,7 @@ class BurstMetadata:
         return item
 
 
-def generate_stac_catalog(safe_url_list):
+def generate_burst_stac_catalog(safe_url_list):
     catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
     stac_item_list = []
 
@@ -202,6 +203,24 @@ def generate_stac_catalog(safe_url_list):
     catalog.add_items(stac_item_list)
 
     return catalog
+
+
+def generate_burst_geodataframe(safe_url_list):
+    series_list = []
+
+    for safe_url in safe_url_list:
+        slc = SLCMetadata(safe_url)
+        for swath_index in range(0, slc.n_swaths):
+            swath = SwathMetadata(slc, 'vv', swath_index)
+            for burst_index in range(0, swath.n_bursts):
+                burst = BurstMetadata(swath, burst_index)
+
+                series_list.append(burst.to_series())
+
+    burst_df = pd.DataFrame(series_list)
+    footprint_geometry = burst_df['footprint'].map(wkt.loads)
+    gdf = gpd.GeoDataFrame(burst_df.drop(columns=['footprint']), geometry=footprint_geometry, crs=4326)
+    return gdf
 
 
 def save_stac_catalog_locally(catalog):

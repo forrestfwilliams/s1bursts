@@ -1,11 +1,10 @@
-import fnmatch
-import json
 import os
 import xml.etree.ElementTree as ET
-import zipfile
 from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+import aiohttp
+from netrc import netrc
 
 import fsspec
 import re
@@ -32,22 +31,50 @@ def fsspec_load_safe_json(slc, interior_path):
     return xml.getroot()
 
 
-class SLCMetadata:
-    def __init__(self, slc_path):
-        self.safe_name = Path(slc_path).name
-        self.manifest = fsspec_load_safe_json(slc_path, 'manifest.safe')
+def create_safe_path(safe_url, interior_path):
+    safe = Path(safe_url).with_suffix('.SAFE').name
+    path = Path(safe) / interior_path
+    return str(path)
 
-        self.file_paths = [x.attrib['href'] for x in self.manifest.findall('.//fileLocation')]
+
+class SLCMetadata:
+    def __init__(self, safe_url):
+        self.safe_url = safe_url
+        self.safe_name = Path(safe_url).with_suffix('.SAFE').name
+        self.manifest, self.file_paths, self.annotation_paths, self.annotations = self.edl_download_metadata()
+
+        self.measurement_paths = [x[2:] for x in self.file_paths if re.search('^\./measurement/s1.*tiff$', x)]
+        self.measurement_paths.sort()
+
         self.relative_orbit = int(self.manifest.findall('.//{*}relativeOrbitNumber')[0].text)
         self.anx_time = float(self.manifest.find('.//{*}startTimeANX').text)
         self.n_swaths = len(self.manifest.findall('.//{*}swath'))
 
-        self.annotation_paths = [x[2:] for x in self.file_paths if re.search('^\./annotation/s1.*xml$', x)]
-        self.annotation_paths.sort()
-        self.annotations = [fsspec_load_safe_json(slc_path, x) for x in self.annotation_paths]
+    @staticmethod
+    def download_safe_xml(zip_fs, safe_url, interior_path):
+        with zip_fs.open(create_safe_path(safe_url, 'manifest.safe')) as f:
+            xml = ET.parse(f)
+        return xml.getroot()
 
-        self.measurement_paths = [x[2:] for x in self.file_paths if re.search('^\./measurement/s1.*tiff$', x)]
-        self.measurement_paths.sort()
+    def edl_download_metadata(self):
+        my_netrc = netrc()
+        username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
+        auth = aiohttp.BasicAuth(username, password)
+
+        storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
+
+        fs = fsspec.filesystem('https', **storage_options['https'])
+        with fs.open(self.safe_url) as fo:
+            safe = fsspec.filesystem('zip', fo=fo)
+            manifest = self.download_safe_xml(safe, self.safe_url, 'manifest.safe')
+
+            file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
+
+            annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
+            annotation_paths.sort()
+            annotations = [self.download_safe_xml(safe, self.safe_url, x) for x in annotation_paths]
+
+        return manifest, file_paths, annotation_paths, annotations
 
 
 class SwathMetadata:

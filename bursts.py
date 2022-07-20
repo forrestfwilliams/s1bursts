@@ -14,6 +14,7 @@ import pandas as pd
 import geopandas as gpd
 import pystac
 from shapely import geometry, wkt
+from shapely.ops import unary_union
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
@@ -174,8 +175,8 @@ class BurstMetadata:
         y2.reverse()
         x = x1 + x2
         y = y1 + y2
-        poly = geometry.Polygon(zip(x, y))
-        return str(poly), poly.bounds
+        footprint = geometry.Polygon(zip(x, y))
+        return footprint, footprint.bounds
 
     def to_series(self):
         attribs = ['absolute_burst_id', 'relative_burst_id', 'datetime', 'footprint']
@@ -187,7 +188,7 @@ class BurstMetadata:
                       'byte_length': self.byte_length, 'stack_id': self.stack_id, 'safe_url': self.safe_url}
         href = f'{self.safe_name}/{self.measurement_path}'
         item = pystac.Item(id=self.absolute_burst_id,
-                           geometry=self.footprint,
+                           geometry=geometry.mapping(self.footprint),
                            bbox=self.bounds,
                            datetime=datetime.strptime(self.datetime, "%Y%m%dT%H%M%S"),
                            properties=properties)
@@ -214,7 +215,26 @@ def get_burst_metadata(safe_url_list):
 
 def generate_burst_stac_catalog(burst_list):
     catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
-    catalog.add_items([x.to_stac_item() for x in burst_list])
+    burst_items = [x.to_stac_item() for x in burst_list]
+    # catalog.add_items(burst_items)
+    stack_ids = set([x.properties['stack_id'] for x in burst_items])
+
+    for stack_id in stack_ids:
+        stack_items = [x for x in burst_items if x.properties['stack_id'] == stack_id]
+        footprints = [geometry.Polygon(x.geometry['coordinates'][0]) for x in stack_items]
+        datetimes = [x.datetime for x in stack_items]
+        footprint = unary_union(footprints)
+        date_min, date_max = min(datetimes), max(datetimes)
+
+        spatial_extent = pystac.SpatialExtent(list(footprint.bounds))
+        temporal_extent = pystac.TemporalExtent(intervals=[[date_min, date_max]])
+        collection_extent = pystac.Extent(spatial=spatial_extent, temporal=temporal_extent)
+        collection = pystac.Collection(id=stack_id,
+                                       description=f'Sentinel-1 Burst Stack {stack_id}',
+                                       extent=collection_extent)
+        collection.add_items(stack_items)
+        catalog.add_child(collection)
+
     return catalog
 
 

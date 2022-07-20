@@ -161,8 +161,7 @@ class BurstMetadata:
         orbital = (self.relative_orbit - 1) * NOMINAL_ORBITAL_DURATION
         time_distance = self.burst_anx_time + orbital
         relative_burstid = 1 + np.floor((time_distance - PREAMBLE_LENGTH) / BEAM_CYCLE_TIME)
-        # TODO relative_burst_id is off by one
-        return int(relative_burstid) + 1
+        return int(relative_burstid)
 
     def create_footprint(self, gcp_df):
         first_line = gcp_df.loc[gcp_df['line'] == self.burst_index * self.lines, ['longitude', 'latitude']]

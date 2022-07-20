@@ -5,6 +5,7 @@ from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
+import asyncio
 
 import aiohttp
 import fsspec
@@ -44,7 +45,7 @@ def download_safe_xml(zip_fs, safe_url, interior_path):
     return xml.getroot()
 
 
-def edl_download_metadata(safe_url):
+def access_safe_zip(safe_url):
     my_netrc = netrc()
     username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
     auth = aiohttp.BasicAuth(username, password)
@@ -52,16 +53,22 @@ def edl_download_metadata(safe_url):
     storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
 
     fs = fsspec.filesystem('https', **storage_options['https'])
-    with fs.open(safe_url) as fo:
-        safe = fsspec.filesystem('zip', fo=fo)
-        manifest = download_safe_xml(safe, safe_url, 'manifest.safe')
+    safe_fs = fsspec.filesystem('zip', fo=fs.open(safe_url))
+    return safe_fs
 
-        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
 
-        annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
-        annotation_paths.sort()
-        annotations = [download_safe_xml(safe, safe_url, x) for x in annotation_paths]
+def edl_download_metadata(safe_url):
+    safe_fs = access_safe_zip(safe_url)
 
+    manifest = download_safe_xml(safe_fs, safe_url, 'manifest.safe')
+
+    file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
+    annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
+    annotation_paths.sort()
+
+    annotations = {x: download_safe_xml(safe_fs, safe_url, x) for x in annotation_paths}
+    # TODO clean up safe_fs corectly
+    del safe_fs
     return manifest, annotations
 
 
@@ -70,12 +77,9 @@ class SLCMetadata:
         self.safe_url = safe_url
         self.manifest = manifest
         self.annotations = annotations
-        self.file_paths = [x.attrib['href'] for x in self.manifest.findall('.//fileLocation')]
-        self.annotation_paths = [x[2:] for x in self.file_paths if re.search('^\./annotation/s1.*xml$', x)]
-        self.annotation_paths.sort()
-
         self.safe_name = Path(safe_url).with_suffix('.SAFE').name
 
+        self.file_paths = [x.attrib['href'] for x in self.manifest.findall('.//fileLocation')]
         self.measurement_paths = [x[2:] for x in self.file_paths if re.search('^\./measurement/s1.*tiff$', x)]
         self.measurement_paths.sort()
 
@@ -90,14 +94,14 @@ class SwathMetadata:
         self.safe_name = slc.safe_name
         self.relative_orbit = slc.relative_orbit
         self.slc_anx_time = slc.slc_anx_time
-
         self.polarization = polarization
         self.swath_index = swath_index
-        self.annotation_path = [x for x in slc.annotation_paths if self.polarization.lower() in x][self.swath_index]
-        self.measurement_path = [x for x in slc.measurement_paths if self.polarization.lower() in x][self.swath_index]
 
-        annotation_index = slc.annotation_paths.index(self.annotation_path)
-        self.annotation = slc.annotations[annotation_index]
+        pattern = f'^.*/s1.-iw{self.swath_index + 1}-slc-{self.polarization.lower()}.*$'
+        self.annotation_path = [x for x in slc.annotations if re.search(pattern, x)][0]
+        self.measurement_path = [x for x in slc.measurement_paths if re.search(pattern, x)][0]
+
+        self.annotation = slc.annotations[self.annotation_path]
 
         self.n_bursts = int(self.annotation.find('.//{*}burstList').attrib['count'])
         self.gcp_df = self.create_gcp_df()
@@ -156,7 +160,7 @@ class BurstMetadata:
         orbital = (self.relative_orbit - 1) * NOMINAL_ORBITAL_DURATION
         time_distance = self.burst_anx_time + orbital
         relative_burstid = 1 + np.floor((time_distance - PREAMBLE_LENGTH) / BEAM_CYCLE_TIME)
-        # FIXME relative_burst_id is off by one
+        # TODO relative_burst_id is off by one
         return int(relative_burstid) + 1
 
     def create_footprint(self, gcp_df):
@@ -193,37 +197,29 @@ class BurstMetadata:
         return item
 
 
-def generate_burst_stac_catalog(safe_url_list):
-    catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
-    stac_item_list = []
+def get_burst_metadata(safe_url_list):
+    bursts = []
 
     for safe_url in safe_url_list:
-        slc = SLCMetadata(safe_url)
+        manifest, annotations = edl_download_metadata(safe_url)
+        slc = SLCMetadata(safe_url, manifest, annotations)
         for swath_index in range(0, slc.n_swaths):
             swath = SwathMetadata(slc, 'vv', swath_index)
             for burst_index in range(0, swath.n_bursts):
                 burst = BurstMetadata(swath, burst_index)
+                bursts.append(burst)
 
-                stac_item_list.append(burst.to_stac_item())
+    return bursts
 
-    catalog.add_items(stac_item_list)
 
+def generate_burst_stac_catalog(burst_list):
+    catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
+    catalog.add_items([x.to_stac_item() for x in burst_list])
     return catalog
 
 
-def generate_burst_geodataframe(safe_url_list):
-    series_list = []
-
-    for safe_url in safe_url_list:
-        slc = SLCMetadata(safe_url)
-        for swath_index in range(0, slc.n_swaths):
-            swath = SwathMetadata(slc, 'vv', swath_index)
-            for burst_index in range(0, swath.n_bursts):
-                burst = BurstMetadata(swath, burst_index)
-
-                series_list.append(burst.to_series())
-
-    burst_df = pd.DataFrame(series_list)
+def generate_burst_geodataframe(burst_list):
+    burst_df = pd.DataFrame([x.to_series() for x in burst_list])
     footprint_geometry = burst_df['footprint'].map(wkt.loads)
     gdf = gpd.GeoDataFrame(burst_df.drop(columns=['footprint']), geometry=footprint_geometry, crs=4326)
     return gdf
@@ -275,22 +271,15 @@ def read_local_burst(item, polarization='VV'):
 
 
 def edl_download_burst_data(item, polarization='VV'):
-    my_netrc = netrc()
-    username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
-    auth = aiohttp.BasicAuth(username, password)
-
-    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
-
-    fs = fsspec.filesystem('https', **storage_options['https'])
-    with fs.open(item.properties['safe_url']) as fo:
-        safe = fsspec.filesystem('zip', fo=fo)
-
-        with safe.open(item.assets[polarization.upper()].href) as f:
-            byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
-                                                  length=item.properties['byte_length'])
+    safe_fs = access_safe_zip(item.properties['safe_url'])
+    with safe_fs.open(item.assets[polarization.upper()].href) as f:
+        byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
+                                              length=item.properties['byte_length'])
 
     arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
     burst_array = arr.copy()
     burst_array.dtype = 'complex'
     burst_array = burst_array.reshape((item.properties['lines'], item.properties['samples']))
+    # TODO clean up safe_fs corectly
+    del safe_fs
     return burst_array

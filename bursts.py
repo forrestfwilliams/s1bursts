@@ -35,30 +35,28 @@ def download_safe_xml(zip_fs, safe_url, interior_path):
     return xml.getroot()
 
 
-def access_safe_zip(safe_url):
+def get_netrc_auth():
     my_netrc = netrc()
     username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
     auth = aiohttp.BasicAuth(username, password)
-
-    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
-
-    fs = fsspec.filesystem('https', **storage_options['https'])
-    safe_fs = fsspec.filesystem('zip', fo=fs.open(safe_url))
-    return safe_fs
+    return auth
 
 
 def edl_download_metadata(safe_url):
-    safe_fs = access_safe_zip(safe_url)
+    auth = get_netrc_auth()
+    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
 
-    manifest = download_safe_xml(safe_fs, safe_url, 'manifest.safe')
+    http_fs = fsspec.filesystem('https', **storage_options['https'])
+    with http_fs.open(safe_url) as fo:
+        safe_zip = fsspec.filesystem('zip', fo=fo)
+        manifest = download_safe_xml(safe_zip, safe_url, 'manifest.safe')
 
-    file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
-    annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
-    annotation_paths.sort()
+        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
+        annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
+        annotation_paths.sort()
 
-    annotations = {x: download_safe_xml(safe_fs, safe_url, x) for x in annotation_paths}
-    # TODO clean up safe_fs corectly
-    del safe_fs
+        annotations = {x: download_safe_xml(safe_zip, safe_url, x) for x in annotation_paths}
+
     return manifest, annotations
 
 
@@ -262,15 +260,23 @@ def initiate_stac_catalog_server(port, catalog_dir):
 
 
 def edl_download_burst_data(item, polarization='VV'):
-    safe_fs = access_safe_zip(item.properties['safe_url'])
-    with safe_fs.open(item.assets[polarization.upper()].href) as f:
-        byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
-                                              length=item.properties['byte_length'])
+    auth = get_netrc_auth()
+    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
+
+    http_fs = fsspec.filesystem('https', **storage_options['https'])
+    with http_fs.open(item.properties['safe_url']) as fo:
+        safe_zip = fsspec.filesystem('zip', fo=fo)
+        with safe_zip.open(item.assets[polarization.upper()].href) as f:
+            byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
+                                                  length=item.properties['byte_length'])
+
+    # safe_fs = access_safe_zip(item.properties['safe_url'])
+    # with safe_fs.open(item.assets[polarization.upper()].href) as f:
+    #     byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
+    #                                           length=item.properties['byte_length'])
 
     arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
     burst_array = arr.copy()
     burst_array.dtype = 'complex'
     burst_array = burst_array.reshape((item.properties['lines'], item.properties['samples']))
-    # TODO clean up safe_fs corectly
-    del safe_fs
     return burst_array

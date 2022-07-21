@@ -23,17 +23,6 @@ PREAMBLE_LENGTH = 2.299849
 BEAM_CYCLE_TIME = 2.758273
 
 
-def generate_path(safe, interior_path, protocol='zip://'):
-    path = f'{protocol}*/{interior_path}::{safe}'
-    return path
-
-
-def fsspec_load_safe_json(slc, interior_path):
-    with fsspec.open(generate_path(slc, interior_path), 'r') as f:
-        xml = ET.parse(f)
-    return xml.getroot()
-
-
 def create_safe_path(safe_url, interior_path):
     safe = Path(safe_url).with_suffix('.SAFE').name
     path = Path(safe) / interior_path
@@ -270,23 +259,6 @@ def initiate_stac_catalog_server(port, catalog_dir):
 
     with HTTPServer(('localhost', port), CORSRequestHandler) as httpd:
         httpd.serve_forever()
-
-
-def read_local_burst(item, polarization='VV'):
-    href = item.get_assets()[polarization].href
-    safe, folder, tif = Path(href).parts
-    safe = safe.replace('SAFE', 'zip')
-    data_path = f'zip://*/{folder}/{tif}::./{safe}'
-
-    with fsspec.open(data_path) as f:
-        byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
-                                              length=item.properties['byte_length'])
-
-    arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
-    fs_burst = arr.copy()
-    fs_burst.dtype = 'complex'
-    fs_burst = fs_burst.reshape((item.properties['lines'], item.properties['samples']))
-    return fs_burst
 
 
 def edl_download_burst_data(item, polarization='VV'):

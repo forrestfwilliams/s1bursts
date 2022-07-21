@@ -5,14 +5,14 @@ from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
-import asyncio
 
 import aiohttp
 import fsspec
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import pystac
+from pqdm.threads import pqdm
 from shapely import geometry, wkt
 from shapely.ops import unary_union
 
@@ -21,43 +21,6 @@ from shapely.ops import unary_union
 NOMINAL_ORBITAL_DURATION = 12 * 24 * 3600 / 175
 PREAMBLE_LENGTH = 2.299849
 BEAM_CYCLE_TIME = 2.758273
-
-
-def create_safe_path(safe_url, interior_path):
-    safe = Path(safe_url).with_suffix('.SAFE').name
-    path = Path(safe) / interior_path
-    return str(path)
-
-
-def download_safe_xml(zip_fs, safe_url, interior_path):
-    with zip_fs.open(create_safe_path(safe_url, interior_path)) as f:
-        xml = ET.parse(f)
-    return xml.getroot()
-
-
-def get_netrc_auth():
-    my_netrc = netrc()
-    username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
-    auth = aiohttp.BasicAuth(username, password)
-    return auth
-
-
-def edl_download_metadata(safe_url):
-    auth = get_netrc_auth()
-    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
-
-    http_fs = fsspec.filesystem('https', **storage_options['https'])
-    with http_fs.open(safe_url) as fo:
-        safe_zip = fsspec.filesystem('zip', fo=fo)
-        manifest = download_safe_xml(safe_zip, safe_url, 'manifest.safe')
-
-        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
-        annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
-        annotation_paths.sort()
-
-        annotations = {x: download_safe_xml(safe_zip, safe_url, x) for x in annotation_paths}
-
-    return manifest, annotations
 
 
 class SLCMetadata:
@@ -184,11 +147,55 @@ class BurstMetadata:
         return item
 
 
-def get_burst_metadata(safe_url_list):
-    bursts = []
+def create_safe_path(safe_url, interior_path):
+    safe = Path(safe_url).with_suffix('.SAFE').name
+    path = Path(safe) / interior_path
+    return str(path)
 
+
+def download_safe_xml(zip_fs, safe_url, interior_path):
+    with zip_fs.open(create_safe_path(safe_url, interior_path)) as f:
+        xml = ET.parse(f)
+    return xml.getroot()
+
+
+def get_netrc_auth():
+    my_netrc = netrc()
+    username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
+    auth = aiohttp.BasicAuth(username, password)
+    return auth
+
+
+def edl_download_metadata(safe_url, auth):
+    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
+
+    http_fs = fsspec.filesystem('https', **storage_options['https'])
+    with http_fs.open(safe_url) as fo:
+        safe_zip = fsspec.filesystem('zip', fo=fo)
+        manifest = download_safe_xml(safe_zip, safe_url, 'manifest.safe')
+
+        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
+        annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
+        annotation_paths.sort()
+
+        annotations = {x: download_safe_xml(safe_zip, safe_url, x) for x in annotation_paths}
+
+    return manifest, annotations
+
+
+def get_burst_metadata(safe_url_list, threads=None):
+    auth = get_netrc_auth()
+
+    if threads:
+        args = [(safe_url, auth) for safe_url in safe_url_list]
+        result = pqdm(args, edl_download_metadata, n_jobs=threads, argument_type="args")
+        safe_metadata = {key: value for key, value in zip(safe_url_list, result)}
+    else:
+        safe_metadata = {x: edl_download_metadata(x, auth) for x in safe_url_list}
+
+    bursts = []
     for safe_url in safe_url_list:
-        manifest, annotations = edl_download_metadata(safe_url)
+        manifest, annotations = safe_metadata[safe_url]
         slc = SLCMetadata(safe_url, manifest, annotations)
         for swath_index in range(0, slc.n_swaths):
             swath = SwathMetadata(slc, 'vv', swath_index)
@@ -224,6 +231,35 @@ def generate_burst_stac_catalog(burst_list):
     return catalog
 
 
+def edl_download_burst(item, auth, polarization='VV'):
+    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
+
+    http_fs = fsspec.filesystem('https', **storage_options['https'])
+    with http_fs.open(item.properties['safe_url']) as fo:
+        safe_zip = fsspec.filesystem('zip', fo=fo)
+        with safe_zip.open(item.assets[polarization.upper()].href) as f:
+            byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
+                                                  length=item.properties['byte_length'])
+
+    arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
+    burst_array = arr.copy()
+    burst_array.dtype = 'complex'
+    burst_array = burst_array.reshape((item.properties['lines'], item.properties['samples']))
+    return burst_array
+
+
+def edl_download_stack(item_list, polarization='VV', threads=None):
+    auth = get_netrc_auth()
+
+    if threads:
+        args = [(x, auth, polarization) for x in item_list]
+        arrays = pqdm(args, edl_download_burst, n_jobs=threads, argument_type="args")
+    else:
+        arrays = [edl_download_burst(x, auth, polarization) for x in item_list]
+
+    return arrays
+
+
 def generate_burst_geodataframe(burst_list):
     burst_df = pd.DataFrame([x.to_series() for x in burst_list])
     footprint_geometry = burst_df['footprint'].map(wkt.loads)
@@ -257,26 +293,3 @@ def initiate_stac_catalog_server(port, catalog_dir):
 
     with HTTPServer(('localhost', port), CORSRequestHandler) as httpd:
         httpd.serve_forever()
-
-
-def edl_download_burst_data(item, polarization='VV'):
-    auth = get_netrc_auth()
-    storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
-
-    http_fs = fsspec.filesystem('https', **storage_options['https'])
-    with http_fs.open(item.properties['safe_url']) as fo:
-        safe_zip = fsspec.filesystem('zip', fo=fo)
-        with safe_zip.open(item.assets[polarization.upper()].href) as f:
-            byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
-                                                  length=item.properties['byte_length'])
-
-    # safe_fs = access_safe_zip(item.properties['safe_url'])
-    # with safe_fs.open(item.assets[polarization.upper()].href) as f:
-    #     byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
-    #                                           length=item.properties['byte_length'])
-
-    arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
-    burst_array = arr.copy()
-    burst_array.dtype = 'complex'
-    burst_array = burst_array.reshape((item.properties['lines'], item.properties['samples']))
-    return burst_array

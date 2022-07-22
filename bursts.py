@@ -5,6 +5,7 @@ from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
+import xarray as xr
 
 import aiohttp
 import fsspec
@@ -231,6 +232,24 @@ def generate_burst_stac_catalog(burst_list):
     return catalog
 
 
+def burst_bytes_to_numpy(burst_bytes, shape):
+    tmp_array = np.frombuffer(burst_bytes, dtype=np.int16).astype(float)
+    array = tmp_array.copy()
+    array.dtype = 'complex'
+    array = array.reshape(shape)
+    return array
+
+
+def burst_numpy_to_xarray(item, array):
+    n_lines, n_samples = item.properties['lines'], item.properties['samples']
+    dims = ('time', 'line', 'sample')
+    coords = ([item.datetime], list(range(n_lines)), list(range(n_samples)))
+    coords = {key: value for key, value in zip(dims, coords)}
+    burst_data_array = xr.DataArray(np.expand_dims(array, axis=0), coords=coords, dims=('time', 'line', 'sample'),
+                                    attrs=item.properties)
+    return burst_data_array
+
+
 def edl_download_burst(item, auth, polarization='VV'):
     storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
 
@@ -241,11 +260,9 @@ def edl_download_burst(item, auth, polarization='VV'):
             byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
                                                   length=item.properties['byte_length'])
 
-    arr = np.frombuffer(byte_string, dtype=np.int16).astype(float)
-    burst_array = arr.copy()
-    burst_array.dtype = 'complex'
-    burst_array = burst_array.reshape((item.properties['lines'], item.properties['samples']))
-    return burst_array
+    array = burst_bytes_to_numpy(byte_string, (item.properties['lines'], item.properties['samples']))
+    burst_data_array = burst_numpy_to_xarray(item, array)
+    return item.id, burst_data_array
 
 
 def edl_download_stack(item_list, polarization='VV', threads=None):
@@ -253,11 +270,12 @@ def edl_download_stack(item_list, polarization='VV', threads=None):
 
     if threads:
         args = [(x, auth, polarization) for x in item_list]
-        arrays = pqdm(args, edl_download_burst, n_jobs=threads, argument_type="args")
+        data_arrays = pqdm(args, edl_download_burst, n_jobs=threads, argument_type="args")
     else:
-        arrays = [edl_download_burst(x, auth, polarization) for x in item_list]
+        data_arrays = [edl_download_burst(x, auth, polarization) for x in item_list]
 
-    return arrays
+    stack_dataset = xr.Dataset({k:v for k,v in data_arrays})
+    return stack_dataset
 
 
 def generate_burst_geodataframe(burst_list):

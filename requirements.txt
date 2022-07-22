@@ -5,3 +5,6 @@ pystac
 fsspec
 aiohttp
 safe-netrc
+pqdm
+xarray
+jupyter

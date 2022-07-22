@@ -133,18 +133,36 @@ class BurstMetadata:
         attrib_dict = {k: getattr(self, k) for k in attribs}
         return pd.Series(attrib_dict)
 
+    # def to_stac_item(self):
+    #     properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
+    #                   'byte_length': self.byte_length, 'stack_id': self.stack_id, 'safe_url': self.safe_url}
+    #     href = f'{self.safe_name}/{self.measurement_path}'
+    #     item = pystac.Item(id=self.absolute_burst_id,
+    #                        geometry=geometry.mapping(self.footprint),
+    #                        bbox=self.bounds,
+    #                        datetime=datetime.strptime(self.datetime, "%Y%m%dT%H%M%S"),
+    #                        properties=properties)
+    #
+    #     item.add_asset(key=self.polarization.upper(),
+    #                    asset=pystac.Asset(href=href, media_type=pystac.MediaType.GEOTIFF))
+    #     return item
+
     def to_stac_item(self):
-        properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
-                      'byte_length': self.byte_length, 'stack_id': self.stack_id, 'safe_url': self.safe_url}
-        href = f'{self.safe_name}/{self.measurement_path}'
+        properties = {'stack_id': self.stack_id}
+
+        asset_properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
+                            'byte_length': self.byte_length,
+                            'interior_path': f'{self.safe_name}/{self.measurement_path}'}
+
         item = pystac.Item(id=self.absolute_burst_id,
                            geometry=geometry.mapping(self.footprint),
                            bbox=self.bounds,
-                           datetime=datetime.strptime(self.datetime, "%Y%m%dT%H%M%S"),
+                           datetime=datetime.strptime(self.datetime, '%Y%m%dT%H%M%S'),
                            properties=properties)
 
         item.add_asset(key=self.polarization.upper(),
-                       asset=pystac.Asset(href=href, media_type=pystac.MediaType.GEOTIFF))
+                       asset=pystac.Asset(href=self.safe_url, media_type=pystac.MediaType.GEOTIFF,
+                                          extra_fields=asset_properties))
         return item
 
 
@@ -241,28 +259,35 @@ def burst_bytes_to_numpy(burst_bytes, shape):
 
 
 def burst_numpy_to_xarray(item, array):
-    n_lines, n_samples = item.properties['lines'], item.properties['samples']
-    dims = ('time', 'line', 'sample')
-    coords = ([item.datetime], list(range(n_lines)), list(range(n_samples)))
+    n_lines, n_samples = array.shape
+    properties = item.properties
+    properties['id'] = item.id
+    #TODO datetime as str
+    properties['datetime'] = item.datetime
+
+    dims = ('line', 'sample')
+    coords = (range(n_lines), range(n_samples))
     coords = {key: value for key, value in zip(dims, coords)}
-    burst_data_array = xr.DataArray(np.expand_dims(array, axis=0), coords=coords, dims=('time', 'line', 'sample'),
-                                    attrs=item.properties)
+
+    burst_data_array = xr.DataArray(array, coords=coords, dims=dims, attrs=properties)
     return burst_data_array
 
 
 def edl_download_burst(item, auth, polarization='VV'):
+    asset = item.assets[polarization].to_dict()
+    lines, samples = asset['lines'], asset['samples']
+    byte_offset, byte_length = asset['byte_offset'], asset['byte_length']
     storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
 
     http_fs = fsspec.filesystem('https', **storage_options['https'])
-    with http_fs.open(item.properties['safe_url']) as fo:
+    with http_fs.open(asset['href']) as fo:
         safe_zip = fsspec.filesystem('zip', fo=fo)
-        with safe_zip.open(item.assets[polarization.upper()].href) as f:
-            byte_string = fsspec.utils.read_block(f, offset=item.properties['byte_offset'],
-                                                  length=item.properties['byte_length'])
+        with safe_zip.open(asset['interior_path']) as f:
+            byte_string = fsspec.utils.read_block(f, offset=byte_offset, length=byte_length)
 
-    array = burst_bytes_to_numpy(byte_string, (item.properties['lines'], item.properties['samples']))
+    array = burst_bytes_to_numpy(byte_string, (lines, samples))
     burst_data_array = burst_numpy_to_xarray(item, array)
-    return item.id, burst_data_array
+    return burst_data_array
 
 
 def edl_download_stack(item_list, polarization='VV', threads=None):
@@ -274,7 +299,12 @@ def edl_download_stack(item_list, polarization='VV', threads=None):
     else:
         data_arrays = [edl_download_burst(x, auth, polarization) for x in item_list]
 
-    stack_dataset = xr.Dataset({k:v for k,v in data_arrays})
+    ids = [x.attrs['id'] for x in data_arrays]
+    dates = [x.attrs['datetime'] for x in data_arrays]
+    n_lines, n_samples = data_arrays[0].data.shape
+    coords = {'time': dates, 'line': range(n_lines), 'sample': range(n_samples)}
+
+    stack_dataset = xr.Dataset({k: v for k, v in zip(ids, data_arrays)}, coords=coords)
     return stack_dataset
 
 

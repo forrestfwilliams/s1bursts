@@ -280,12 +280,15 @@ def edl_download_burst(item, auth, polarization='VV'):
     storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
 
     http_fs = fsspec.filesystem('https', **storage_options['https'])
-    with http_fs.open(asset['href']) as fo:
-        safe_zip = fsspec.filesystem('zip', fo=fo)
-        with safe_zip.open(asset['interior_path']) as f:
-            byte_string = fsspec.utils.read_block(f, offset=byte_offset, length=byte_length)
+    with http_fs.open(asset['href']) as http_f:
+        zip_fs = fsspec.filesystem('zip', fo=http_f)
+        with zip_fs.open(asset['interior_path']) as f:
+            burst_bytes = f.read()[byte_offset:byte_offset + byte_length]
 
-    array = burst_bytes_to_numpy(byte_string, (lines, samples))
+            # f.seek(byte_offset)
+            # burst_bytes = f.read(byte_length)
+
+    array = burst_bytes_to_numpy(burst_bytes, (lines, samples))
     burst_data_array = burst_numpy_to_xarray(item, array)
     return burst_data_array
 

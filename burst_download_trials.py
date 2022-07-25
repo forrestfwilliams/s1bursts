@@ -5,6 +5,7 @@ import time
 import sys
 import cProfile
 import pstats
+import mmap
 
 
 def get_netrc_auth():
@@ -40,7 +41,7 @@ def http_swath(auth, url_path, interior_path, byte_offset, byte_length):
     return swath_bytes
 
 
-def benchmark(fun, **args):
+def benchmark(fun, args):
     start = time.time()
     result = fun(**args)
     end = time.time()
@@ -93,17 +94,10 @@ if __name__ == '__main__':
     # _ = profile_function_call(http_burst, dataset1, 'dataset1.prof')
     # _ = profile_function_call(http_burst, dataset2, 'dataset2.prof')
 
-    _ = benchmark(http_burst, dataset1)
-    _ = benchmark(http_burst, dataset2)
-    _ = benchmark(http_burst, dataset3)
-    _ = benchmark(http_burst, dataset4)
-
-    print('')
-
-    _ = benchmark(http_swath, dataset1)
-    _ = benchmark(http_swath, dataset2)
-    _ = benchmark(http_swath, dataset3)
-    _ = benchmark(http_swath, dataset4)
+    for test_fun in [http_burst, http_swath]:
+        for dataset in [dataset1, dataset2, dataset3, dataset4]:
+            _ = benchmark(test_fun, dataset)
+        print('')
 
     """
     Forrest's results

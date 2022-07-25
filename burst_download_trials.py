@@ -35,15 +35,14 @@ def http_swath(auth, url_path, interior_path, byte_offset, byte_length):
             swath_bytes = f.read()
 
     burst_bytes = swath_bytes[byte_offset:byte_offset + byte_length]
-
-    return burst_bytes
+    return swath_bytes
 
 
 def benchmark(auth, fun, dataset):
     start = time.time()
     result = fun(auth, **dataset)
     end = time.time()
-    print(fun.__name__, type(result), f'{sys.getsizeof(result) * 1e-6:.2f} mb', f'{end - start:.2f} s')
+    print(f'using {fun.__name__} downloaded {sys.getsizeof(result) * 1e-6:.2f}mb in {end - start:.2f}s')
     return result
 
 
@@ -88,13 +87,13 @@ if __name__ == '__main__':
 
     """
     Forrest's results
-    http_burst <class 'bytes'> 152.03 mb 23.50 s
-    http_burst <class 'bytes'> 147.22 mb 89.82 s
-    http_burst <class 'bytes'> 127.43 mb 55.19 s
-    http_burst <class 'bytes'> 127.42 mb 194.87 s
+    using http_burst downloaded 152.03mb in 24.19s
+    using http_burst downloaded 147.22mb in 97.83s
+    using http_burst downloaded 127.43mb in 43.84s
+    using http_burst downloaded 127.42mb in 186.28s
 
-    http_swath <class 'bytes'> 152.03 mb 38.60 s
-    http_swath <class 'bytes'> 147.22 mb 37.71 s
-    http_swath <class 'bytes'> 127.43 mb 34.66 s
-    http_swath <class 'bytes'> 127.42 mb 36.78 s
+    using http_swath downloaded 1368.50mb in 43.25s
+    using http_swath downloaded 1325.17mb in 137.98s
+    using http_swath downloaded 1147.09mb in 39.45s
+    using http_swath downloaded 1147.04mb in 36.05s
     """

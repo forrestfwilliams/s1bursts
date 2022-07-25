@@ -3,6 +3,8 @@ import aiohttp
 import fsspec
 import time
 import sys
+import cProfile
+import pstats
 
 
 def get_netrc_auth():
@@ -38,52 +40,70 @@ def http_swath(auth, url_path, interior_path, byte_offset, byte_length):
     return swath_bytes
 
 
-def benchmark(auth, fun, dataset):
+def benchmark(fun, **args):
     start = time.time()
-    result = fun(auth, **dataset)
+    result = fun(**args)
     end = time.time()
     print(f'using {fun.__name__} downloaded {sys.getsizeof(result) * 1e-6:.2f}mb in {end - start:.2f}s')
     return result
 
 
+def profile_function_call(fn, args, file_name='profile.prof'):
+    with cProfile.Profile() as pr:
+        result = fn(**args)
+
+    stats = pstats.Stats(pr)
+    stats.sort_stats(pstats.SortKey.TIME)
+    stats.print_stats()
+    stats.dump_stats(filename=file_name)
+    return result
+
+
 if __name__ == '__main__':
+    netrc_auth = get_netrc_auth()
+
     dataset1 = dict(
+        auth=netrc_auth,
         url_path="https://datapool.asf.alaska.edu/SLC/SB/S1B_IW_SLC__1SDV_20210107T151555_20210107T151622_025050_02FB52_DB32.zip",
         interior_path="S1B_IW_SLC__1SDV_20210107T151555_20210107T151622_025050_02FB52_DB32.SAFE/measurement/s1b-iw2-slc-vv-20210107t151555-20210107t151621-025050-02fb52-005.tiff",
         byte_offset=109323,
         byte_length=152029824)
 
     dataset2 = dict(
+        auth=netrc_auth,
         url_path="https://datapool.asf.alaska.edu/SLC/SB/S1B_IW_SLC__1SDV_20210107T151555_20210107T151622_025050_02FB52_DB32.zip",
         interior_path="S1B_IW_SLC__1SDV_20210107T151555_20210107T151622_025050_02FB52_DB32.SAFE/measurement/s1b-iw3-slc-vv-20210107t151556-20210107t151621-025050-02fb52-006.tiff",
         byte_offset=441755895,
         byte_length=147215404)
 
     dataset3 = dict(
+        auth=netrc_auth,
         url_path="https://datapool.asf.alaska.edu/SLC/SB/S1B_IW_SLC__1SDV_20210212T151554_20210212T151621_025575_030C38_5BC5.zip",
         interior_path="S1B_IW_SLC__1SDV_20210212T151554_20210212T151621_025575_030C38_5BC5.SAFE/measurement/s1b-iw1-slc-vv-20210212t151556-20210212t151621-025575-030c38-004.tiff",
         byte_offset=147215404,
         byte_length=127429680)
 
     dataset4 = dict(
+        auth=netrc_auth,
         url_path="https://datapool.asf.alaska.edu/SLC/SB/S1B_IW_SLC__1SDV_20210224T151554_20210224T151621_025750_0311EE_7026.zip",
         interior_path="S1B_IW_SLC__1SDV_20210224T151554_20210224T151621_025750_0311EE_7026.SAFE/measurement/s1b-iw1-slc-vv-20210224t151556-20210224t151621-025750-0311ee-004.tiff",
         byte_offset=1019497835,
         byte_length=127423672)
 
-    auth = get_netrc_auth()
+    # _ = profile_function_call(http_burst, dataset1, 'dataset1.prof')
+    # _ = profile_function_call(http_burst, dataset2, 'dataset2.prof')
 
-    _ = benchmark(auth, http_burst, dataset1)
-    _ = benchmark(auth, http_burst, dataset2)
-    _ = benchmark(auth, http_burst, dataset3)
-    _ = benchmark(auth, http_burst, dataset4)
+    _ = benchmark(http_burst, dataset1)
+    _ = benchmark(http_burst, dataset2)
+    _ = benchmark(http_burst, dataset3)
+    _ = benchmark(http_burst, dataset4)
 
     print('')
 
-    _ = benchmark(auth, http_swath, dataset1)
-    _ = benchmark(auth, http_swath, dataset2)
-    _ = benchmark(auth, http_swath, dataset3)
-    _ = benchmark(auth, http_swath, dataset4)
+    _ = benchmark(http_swath, dataset1)
+    _ = benchmark(http_swath, dataset2)
+    _ = benchmark(http_swath, dataset3)
+    _ = benchmark(http_swath, dataset4)
 
     """
     Forrest's results

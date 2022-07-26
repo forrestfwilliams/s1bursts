@@ -9,3 +9,4 @@ pqdm
 pystac
 safe-netrc
 xarray
+zarr

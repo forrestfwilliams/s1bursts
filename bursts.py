@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
-import xarray as xr
 
 import aiohttp
 import fsspec
@@ -13,6 +12,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pystac
+from pystac.extensions import sat, sar
+import xarray as xr
 from pqdm.threads import pqdm
 from shapely import geometry, wkt
 from shapely.ops import unary_union
@@ -347,7 +348,7 @@ def burst_numpy_to_xarray(item, array):
     properties = item.properties
     properties['id'] = item.id
     # TODO datetime as str
-    properties['datetime'] = item.datetime
+    properties['datetime'] = convert_dt(item.datetime)
 
     dims = ('line', 'sample')
     coords = (range(n_lines), range(n_samples))
@@ -387,7 +388,7 @@ def edl_download_stack(item_list, polarization='VV', threads=None):
         data_arrays = [edl_download_burst(x, auth, polarization) for x in item_list]
 
     ids = [x.attrs['id'] for x in data_arrays]
-    dates = [x.attrs['datetime'] for x in data_arrays]
+    dates = [convert_dt(x.attrs['datetime']) for x in data_arrays]
     n_lines, n_samples = data_arrays[0].data.shape
     coords = {'time': dates, 'line': range(n_lines), 'sample': range(n_samples)}
 

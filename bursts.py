@@ -1,7 +1,7 @@
 import os
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
@@ -22,6 +22,16 @@ from shapely.ops import unary_union
 NOMINAL_ORBITAL_DURATION = 12 * 24 * 3600 / 175
 PREAMBLE_LENGTH = 2.299849
 BEAM_CYCLE_TIME = 2.758273
+SPEED_OF_LIGHT = 299792458.0
+
+
+def convert_dt(dt_object):
+    dt_format = '%Y-%m-%dT%H:%M:%S.%f'
+    if isinstance(dt_object, str):
+        dt = datetime.strptime(dt_object, dt_format)
+    else:
+        dt = dt_object.strftime(dt_format)
+    return dt
 
 
 class SLCMetadata:
@@ -36,26 +46,57 @@ class SLCMetadata:
         self.measurement_paths.sort()
 
         self.relative_orbit = int(self.manifest.findall('.//{*}relativeOrbitNumber')[0].text)
-        self.slc_anx_time = float(self.manifest.find('.//{*}startTimeANX').text)
+        self.absolute_orbit = int(self.manifest.findall('.//{*}orbitNumber')[0].text)
+        self.polarizations = list({x.split('-')[3] for x in self.annotations.keys()})
+        self.orbit_direction = self.manifest.findtext('.//{*}pass').lower()
         self.n_swaths = len(self.manifest.findall('.//{*}swath'))
+
+        self.iw2_mid_range = self.calculate_iw2_mid_range()
+
+    def calculate_iw2_mid_range(self):
+        iw2_annotation = [self.annotations[k] for k in self.annotations if 'iw2' in k][0]
+        iw2_slant_range_time = float(iw2_annotation.findtext('.//{*}slantRangeTime'))
+        iw2_n_samples = int(iw2_annotation.findtext('.//{*}samplesPerBurst'))
+        iw2_starting_range = iw2_slant_range_time * SPEED_OF_LIGHT / 2
+        iw2_range_sampling_rate = float(iw2_annotation.findtext('.//{*}rangeSamplingRate'))
+        range_pxl_spacing = SPEED_OF_LIGHT / (2 * iw2_range_sampling_rate)
+        iw2_mid_range = iw2_starting_range + 0.5 * iw2_n_samples * range_pxl_spacing
+        return iw2_mid_range
 
 
 class SwathMetadata:
     def __init__(self, slc, polarization, swath_index):
-        self.safe_url = slc.safe_url
-        self.safe_name = slc.safe_name
-        self.relative_orbit = slc.relative_orbit
-        self.slc_anx_time = slc.slc_anx_time
+        if polarization.lower() not in slc.polarizations:
+            raise (IndexError(f'There is no {polarization.lower()} polarization for this SLC'))
         self.polarization = polarization
         self.swath_index = swath_index
+
+        attrs = ['safe_url', 'safe_name', 'absolute_orbit', 'relative_orbit', 'orbit_direction', 'iw2_mid_range']
+        [setattr(self, x, getattr(slc, x)) for x in attrs]
 
         pattern = f'^.*/s1.-iw{self.swath_index + 1}-slc-{self.polarization.lower()}.*$'
         self.annotation_path = [x for x in slc.annotations if re.search(pattern, x)][0]
         self.measurement_path = [x for x in slc.measurement_paths if re.search(pattern, x)][0]
-
         self.annotation = slc.annotations[self.annotation_path]
 
         self.n_bursts = int(self.annotation.find('.//{*}burstList').attrib['count'])
+        self.radar_center_frequency = float(self.annotation.findtext('.//{*}radarFrequency'))
+        self.wavelength = self.radar_center_frequency / SPEED_OF_LIGHT
+        self.azimuth_steer_rate = float(self.annotation.findtext('.//{*}azimuthSteeringRate'))
+        self.azimuth_time_interval = float(self.annotation.findtext('.//{*}azimuthTimeInterval'))
+        self.slant_range_time = float(self.annotation.findtext('.//{*}slantRangeTime'))
+        self.starting_range = self.slant_range_time * SPEED_OF_LIGHT / 2
+        self.range_sampling_rate = float(self.annotation.findtext('.//{*}rangeSamplingRate'))
+        self.range_pixel_spacing = SPEED_OF_LIGHT / 2 * self.range_sampling_rate
+        self.range_bandwidth = float(self.annotation.findtext('.//{*}processingBandwidth'))
+        self.range_window_type = self.annotation.findtext('.//{*}windowType').lower()
+        self.range_window_coefficient = float(self.annotation.findtext('.//{*}windowCoefficient'))
+        self.rank = int(self.annotation.findtext('.//{*}downlinkValues/rank'))
+        self.prf_raw_data = float(self.annotation.findtext('.//{*}prf'))
+        self.range_chirp_rate = float(self.annotation.findtext('.//{*}txPulseRampRate'))
+
+        self.azimuth_frame_rates = self.get_polynomials('.//{*}azimuthFmRateList', 'azimuthFmRatePolynomial')
+        self.dopplers = self.get_polynomials('.//{*}dcEstimateList', 'dataDcPolynomial')
         self.gcp_df = self.create_gcp_df()
 
     @staticmethod
@@ -72,41 +113,83 @@ class SwathMetadata:
         gcp_df = gcp_df.sort_values(['line', 'pixel']).reset_index(drop=True)
         return gcp_df
 
+    def get_polynomials(self, xml_pattern, poly_name):
+        doppler_list_element = self.annotation.find(xml_pattern)
+        polynomial_list = [self.parse_polynomial_element(x, poly_name) for x in doppler_list_element]
+        polynomials = {k: v for k, v in polynomial_list}
+        return polynomials
+
+    @staticmethod
+    def parse_polynomial_element(poly_element, poly_name):
+        ref_time = poly_element.findtext('azimuthTime')
+
+        half_c = 0.5 * SPEED_OF_LIGHT
+        r0 = half_c * float(poly_element.findtext('t0'))
+        coeffs = [float(x) for x in poly_element.findtext(poly_name).split()]
+        poly1d_inputs = [coeffs, r0, half_c]  # inputs to isce3.core.Poly1d class
+        return ref_time, poly1d_inputs
+
 
 class BurstMetadata:
     def __init__(self, swath, burst_index):
-        self.safe_url = swath.safe_url
-        self.safe_name = swath.safe_name
-        self.polarization = swath.polarization
-        self.swath_index = swath.swath_index
         self.burst_index = burst_index
-        self.annotation_path = swath.annotation_path
-        self.measurement_path = swath.measurement_path
-        self.relative_orbit = swath.relative_orbit
-        self.slc_anx_time = swath.slc_anx_time
+        attrs = ['absolute_orbit', 'annotation_path', 'azimuth_time_interval', 'iw2_mid_range', 'measurement_path',
+                 'orbit_direction', 'polarization', 'prf_raw_data', 'radar_center_frequency', 'range_bandwidth',
+                 'range_chirp_rate', 'range_pixel_spacing', 'range_sampling_rate', 'range_window_coefficient',
+                 'range_window_type', 'rank', 'relative_orbit', 'safe_name', 'safe_url', 'slant_range_time',
+                 'starting_range', 'swath_index', 'wavelength']
+        [setattr(self, x, getattr(swath, x)) for x in attrs]
 
         burst_annotations = swath.annotation.findall('.//{*}burst')
-        byte_offset0 = int(burst_annotations[0].find('.//{*}byteOffset').text)
-        byte_offset1 = int(burst_annotations[1].find('.//{*}byteOffset').text)
+        byte_offset0 = int(burst_annotations[0].findtext('.//{*}byteOffset'))
+        byte_offset1 = int(burst_annotations[1].findtext('.//{*}byteOffset'))
         self.burst_annotation = burst_annotations[burst_index]
-        self.byte_offset = int(self.burst_annotation.find('.//{*}byteOffset').text)
+        self.byte_offset = int(self.burst_annotation.findtext('.//{*}byteOffset'))
         self.byte_length = byte_offset1 - byte_offset0
 
-        self.lines = int(swath.annotation.find('.//{*}linesPerBurst').text)
-        self.samples = int(swath.annotation.find('.//{*}samplesPerBurst').text)
+        self.lines = int(swath.annotation.findtext('.//{*}linesPerBurst'))
+        self.samples = int(swath.annotation.findtext('.//{*}samplesPerBurst'))
+        self.sensing_start = self.burst_annotation.findtext('.//{*}azimuthTime')
         self.burst_anx_time = float(self.burst_annotation.find('.//{*}azimuthAnxTime').text)
-        self.datetime = self.reformat_datetime()
+
+        self.azimuth_frame_rate = self.get_nearest_polynomial(swath.azimuth_frame_rates)
+        self.doppler = self.get_nearest_polynomial(swath.dopplers)
+        self.first_valid_sample, self.last_sample, self.first_valid_line, self.last_line = self.get_lines_and_samples()
 
         self.relative_burst_id = self.calculate_relative_burstid()
         self.stack_id = f'{self.relative_burst_id}_IW{self.swath_index + 1}'
-        self.footprint, self.bounds = self.create_footprint(swath.gcp_df)
-        self.absolute_burst_id = f'S1_SLC_{self.datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
+        self.footprint, self.bounds, self.center = self.create_geometry(swath.gcp_df)
+        reformatted_datetime = convert_dt(self.sensing_start).strftime('%Y%m%dT%H%M%S')
+        self.absolute_burst_id = f'S1_SLC_{reformatted_datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
 
-    def reformat_datetime(self):
-        in_format = '%Y-%m-%dT%H:%M:%S.%f'
-        out_format = '%Y%m%dT%H%M%S'
-        dt = datetime.strptime(self.burst_annotation.find('.//{*}sensingTime').text, in_format)
-        return dt.strftime(out_format)
+    def get_nearest_polynomial(self, time_poly_pair):
+        d_seconds = 0.5 * (self.lines - 1) * self.azimuth_time_interval
+        t_mid = convert_dt(self.sensing_start) + timedelta(seconds=d_seconds)
+
+        t_all = sorted([convert_dt(x) for x in time_poly_pair.keys()])
+
+        # calculate 1st dt and polynomial
+        t_start = t_all[0]
+        dt = self.get_abs_dt(t_mid, t_start)
+        nearest_poly = time_poly_pair[convert_dt(t_start)]
+
+        # loop thru remaining time, polynomial pairs
+        for t_iter in t_all[1:]:
+            temp_dt = self.get_abs_dt(t_mid, t_iter)
+
+            # stop looping if dt starts growing
+            if temp_dt > dt:
+                break
+
+            # set dt and polynomial for next iteration
+            dt, nearest_poly = temp_dt, time_poly_pair[convert_dt(t_iter)]
+
+        return nearest_poly
+
+    @staticmethod
+    def get_abs_dt(t_mid, t_new):
+        abs_dt = np.abs((t_mid - t_new).total_seconds())
+        return abs_dt
 
     def calculate_relative_burstid(self):
         orbital = (self.relative_orbit - 1) * NOMINAL_ORBITAL_DURATION
@@ -114,7 +197,7 @@ class BurstMetadata:
         relative_burstid = 1 + np.floor((time_distance - PREAMBLE_LENGTH) / BEAM_CYCLE_TIME)
         return int(relative_burstid)
 
-    def create_footprint(self, gcp_df):
+    def create_geometry(self, gcp_df):
         first_line = gcp_df.loc[gcp_df['line'] == self.burst_index * self.lines, ['longitude', 'latitude']]
         second_line = gcp_df.loc[gcp_df['line'] == (self.burst_index + 1) * self.lines, ['longitude', 'latitude']]
         x1 = first_line['longitude'].tolist()
@@ -126,26 +209,27 @@ class BurstMetadata:
         x = x1 + x2
         y = y1 + y2
         footprint = geometry.Polygon(zip(x, y))
-        return footprint, footprint.bounds
+        return footprint, footprint.bounds, footprint.centroid.xy
+
+    def get_lines_and_samples(self):
+        first_valid_samples = [int(x) for x in self.burst_annotation.findtext('firstValidSample').split()]
+        last_valid_samples = [int(x) for x in self.burst_annotation.findtext('lastValidSample').split()]
+
+        first_valid_line = [x >= 0 for x in first_valid_samples].index(True)
+        n_valid_lines = [x >= 0 for x in first_valid_samples].count(True)
+        last_line = first_valid_line + n_valid_lines - 1
+
+        first_valid_sample = max(first_valid_samples[first_valid_line],
+                                 first_valid_samples[last_line])
+        last_sample = min(last_valid_samples[first_valid_line],
+                          last_valid_samples[last_line])
+
+        return first_valid_sample, last_sample, first_valid_line, last_line,
 
     def to_series(self):
         attribs = ['absolute_burst_id', 'relative_burst_id', 'datetime', 'footprint']
         attrib_dict = {k: getattr(self, k) for k in attribs}
         return pd.Series(attrib_dict)
-
-    # def to_stac_item(self):
-    #     properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
-    #                   'byte_length': self.byte_length, 'stack_id': self.stack_id, 'safe_url': self.safe_url}
-    #     href = f'{self.safe_name}/{self.measurement_path}'
-    #     item = pystac.Item(id=self.absolute_burst_id,
-    #                        geometry=geometry.mapping(self.footprint),
-    #                        bbox=self.bounds,
-    #                        datetime=datetime.strptime(self.datetime, "%Y%m%dT%H%M%S"),
-    #                        properties=properties)
-    #
-    #     item.add_asset(key=self.polarization.upper(),
-    #                    asset=pystac.Asset(href=href, media_type=pystac.MediaType.GEOTIFF))
-    #     return item
 
     def to_stac_item(self):
         properties = {'stack_id': self.stack_id}
@@ -157,7 +241,7 @@ class BurstMetadata:
         item = pystac.Item(id=self.absolute_burst_id,
                            geometry=geometry.mapping(self.footprint),
                            bbox=self.bounds,
-                           datetime=datetime.strptime(self.datetime, '%Y%m%dT%H%M%S'),
+                           datetime=convert_dt(self.sensing_start),
                            properties=properties)
 
         item.add_asset(key=self.polarization.upper(),
@@ -262,7 +346,7 @@ def burst_numpy_to_xarray(item, array):
     n_lines, n_samples = array.shape
     properties = item.properties
     properties['id'] = item.id
-    #TODO datetime as str
+    # TODO datetime as str
     properties['datetime'] = item.datetime
 
     dims = ('line', 'sample')
@@ -283,10 +367,10 @@ def edl_download_burst(item, auth, polarization='VV'):
     with http_fs.open(asset['href']) as http_f:
         zip_fs = fsspec.filesystem('zip', fo=http_f)
         with zip_fs.open(asset['interior_path']) as f:
-            burst_bytes = f.read()[byte_offset:byte_offset + byte_length]
+            # burst_bytes = f.read()[byte_offset:byte_offset + byte_length]  # downloads swath @40mb/s
 
-            # f.seek(byte_offset)
-            # burst_bytes = f.read(byte_length)
+            f.seek(byte_offset)  # downloads burst @15mb/s
+            burst_bytes = f.read(byte_length)
 
     array = burst_bytes_to_numpy(burst_bytes, (lines, samples))
     burst_data_array = burst_numpy_to_xarray(item, array)

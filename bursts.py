@@ -25,6 +25,7 @@ NOMINAL_ORBITAL_DURATION = 12 * 24 * 3600 / 175
 PREAMBLE_LENGTH = 2.299849
 BEAM_CYCLE_TIME = 2.758273
 SPEED_OF_LIGHT = 299792458.0
+INTERNATIONAL_IDS = {'S1A': ' 2014-016A', 'S1B': '2016-025A'}
 
 
 def convert_dt(dt_object):
@@ -86,13 +87,13 @@ class SwathMetadata:
 
         self.n_bursts = int(self.annotation.find('.//{*}burstList').attrib['count'])
         self.radar_center_frequency = float(self.annotation.findtext('.//{*}radarFrequency'))
-        self.wavelength = self.radar_center_frequency / SPEED_OF_LIGHT
-        self.azimuth_steer_rate = float(self.annotation.findtext('.//{*}azimuthSteeringRate'))
+        self.wavelength = SPEED_OF_LIGHT / self.radar_center_frequency
+        self.azimuth_steer_rate = np.radians(float(self.annotation.findtext('.//{*}azimuthSteeringRate')))
         self.azimuth_time_interval = float(self.annotation.findtext('.//{*}azimuthTimeInterval'))
         self.slant_range_time = float(self.annotation.findtext('.//{*}slantRangeTime'))
         self.starting_range = self.slant_range_time * SPEED_OF_LIGHT / 2
         self.range_sampling_rate = float(self.annotation.findtext('.//{*}rangeSamplingRate'))
-        self.range_pixel_spacing = SPEED_OF_LIGHT / 2 * self.range_sampling_rate
+        self.range_pixel_spacing = SPEED_OF_LIGHT / (2 * self.range_sampling_rate)
         self.range_bandwidth = float(self.annotation.findtext('.//{*}processingBandwidth'))
         self.range_window_type = self.annotation.findtext('.//{*}windowType').lower()
         self.range_window_coefficient = float(self.annotation.findtext('.//{*}windowCoefficient'))
@@ -156,6 +157,7 @@ class BurstMetadata:
         self.lines = int(swath.annotation.findtext('.//{*}linesPerBurst'))
         self.samples = int(swath.annotation.findtext('.//{*}samplesPerBurst'))
         self.sensing_start = self.burst_annotation.findtext('.//{*}azimuthTime')
+        self.sensing_stop = self.burst_annotation.findtext('.//{*}azimuthTime')
         self.burst_anx_delta = float(self.burst_annotation.find('.//{*}azimuthAnxTime').text)
         self.burst_anx = self.slc_start_anx + self.burst_anx_delta
 
@@ -165,7 +167,7 @@ class BurstMetadata:
 
         self.relative_burst_id = self.calculate_relative_burstid()
         self.stack_id = f'{self.relative_burst_id}_IW{self.swath_index + 1}'
-        self.opera_id = f't{self.relative_orbit}_{self.stack_id}'
+        self.opera_id = f't{self.relative_orbit}_{self.stack_id.lower()}'
         self.footprint, self.bounds, self.center = self.create_geometry(swath.gcp_df)
         reformatted_datetime = convert_dt(self.sensing_start).strftime('%Y%m%dT%H%M%S')
         self.absolute_burst_id = f'S1_SLC_{reformatted_datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
@@ -203,6 +205,8 @@ class BurstMetadata:
         orbital = (self.relative_orbit - 1) * NOMINAL_ORBITAL_DURATION
         time_distance = self.burst_anx_delta + orbital
         relative_burstid = 1 + np.floor((time_distance - PREAMBLE_LENGTH) / BEAM_CYCLE_TIME)
+        # TODO relative_burstid is off by one
+        relative_burstid += 1
         return int(relative_burstid)
 
     def create_geometry(self, gcp_df):
@@ -217,7 +221,8 @@ class BurstMetadata:
         x = x1 + x2
         y = y1 + y2
         footprint = geometry.Polygon(zip(x, y))
-        return footprint, footprint.bounds, footprint.centroid.xy
+        centroid = tuple([x[0] for x in footprint.centroid.xy])
+        return footprint, footprint.bounds, centroid
 
     def get_lines_and_samples(self):
         first_valid_samples = [int(x) for x in self.burst_annotation.findtext('firstValidSample').split()]
@@ -240,8 +245,6 @@ class BurstMetadata:
         return pd.Series(attrib_dict)
 
     def to_stac_item(self):
-        internation_ids = {'S1A': ' 2014-016A', 'S1B': '2016-025A'}
-
         properties = {'stack_id': self.stack_id}
         for_opera = ['wavelength', 'azimuth_steer_rate', 'azimuth_time_interval', 'slant_range_time', 'starting_range',
                      'iw2_mid_range', 'range_sampling_rate', 'range_pixel_spacing', 'azimuth_frame_rate', 'doppler',
@@ -262,7 +265,7 @@ class BurstMetadata:
 
         ext_sat = sat.SatExtension.ext(item, add_if_missing=True)
         ext_sat.apply(sat.OrbitState(self.orbit_direction), self.relative_orbit, self.absolute_orbit,
-                      internation_ids[self.platform],
+                      INTERNATIONAL_IDS[self.platform],
                       convert_dt(self.sensing_start))
 
         ext_sar = sar.SarExtension.ext(item, add_if_missing=True)
@@ -468,3 +471,73 @@ def initiate_stac_catalog_server(port, catalog_dir):
 
     with HTTPServer(('localhost', port), CORSRequestHandler) as httpd:
         httpd.serve_forever()
+
+
+def stac_item_to_opera_burst(item, polarization, orbit_dir):
+    import isce3
+    import s1reader
+    from s1reader import Sentinel1BurstSlc
+
+    properties = item.properties
+    asset = item.assets[polarization.upper()]
+    asset_properties = asset.to_dict()
+
+    # platform
+    platform = \
+    [k for k in INTERNATIONAL_IDS if INTERNATIONAL_IDS[k] == properties['sat:platform_international_designator']][0]
+
+    # doppler
+    shape = (asset_properties['lines'], asset_properties['samples'])
+    doppler_poly1d = isce3.core.Poly1d(*properties['doppler'])
+    doppler_lut2d = s1reader.s1_reader.doppler_poly1d_to_lut2d(doppler_poly1d,
+                                                               properties['starting_range'],
+                                                               properties['range_pixel_spacing'],
+                                                               shape,
+                                                               properties['azimuth_time_interval'])
+    doppler = s1reader.s1_burst_slc.Doppler(doppler_poly1d, doppler_lut2d)
+
+    # orbit
+    orbit_path = s1reader.get_orbit_file_from_dir(asset.href.split('/')[-1], orbit_dir)
+    with open(orbit_path, 'r') as f:
+        orbit_xml = ET.parse(f)
+    osv_list = orbit_xml.find('Data_Block/List_of_OSVs')
+    sensing_duration = timedelta(seconds=shape[0] * properties['azimuth_time_interval'])
+    orbit = s1reader.s1_reader.get_burst_orbit(item.datetime, item.datetime + sensing_duration, osv_list)
+
+    args = dict(
+        sensing_start=item.datetime,
+        radar_center_frequency=properties['sar:center_frequency'],
+        wavelength=properties['wavelength'],
+        azimuth_steer_rate=properties['azimuth_steer_rate'],
+        azimuth_time_interval=properties['azimuth_time_interval'],
+        slant_range_time=properties['slant_range_time'],
+        starting_range=properties['starting_range'],
+        iw2_mid_range=properties['iw2_mid_range'],
+        range_sampling_rate=properties['range_sampling_rate'],
+        range_pixel_spacing=properties['range_pixel_spacing'],
+        shape=shape,
+        azimuth_fm_rate=isce3.core.Poly1d(*properties['azimuth_frame_rate']),
+        doppler=doppler,
+        range_bandwidth=properties['range_bandwidth'],
+        polarization=polarization,
+        burst_id=properties['opera_id'],
+        platform_id=platform,
+        center=properties['center'],
+        border=list(item.geometry['coordinates'][0]),
+        orbit=orbit,
+        orbit_direction=properties['sat:orbit_state'].capitalize(),
+        tiff_path=f'{asset.href}/{asset_properties["interior_path"]}',
+        i_burst=properties['burst_index'],
+        first_valid_sample=properties['first_valid_sample'],
+        last_valid_sample=properties['last_valid_sample'],
+        first_valid_line=properties['first_valid_line'],
+        last_valid_line=properties['last_valid_line'],
+        range_window_type=properties['range_window_type'].capitalize(),
+        range_window_coefficient=properties['range_window_coefficient'],
+        rank=properties['rank'],
+        prf_raw_data=properties['prf_raw_data'],
+        range_chirp_rate=properties['range_chirp_rate']
+    )
+
+    opera_burst = Sentinel1BurstSlc(**args)
+    return opera_burst

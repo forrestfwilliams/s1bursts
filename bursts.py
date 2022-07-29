@@ -41,6 +41,7 @@ class SLCMetadata:
         self.manifest = manifest
         self.annotations = annotations
         self.safe_name = Path(safe_url).with_suffix('.SAFE').name
+        self.platform = self.safe_name[0:3].upper()
 
         self.file_paths = [x.attrib['href'] for x in self.manifest.findall('.//fileLocation')]
         self.measurement_paths = [x[2:] for x in self.file_paths if re.search('^\./measurement/s1.*tiff$', x)]
@@ -50,6 +51,7 @@ class SLCMetadata:
         self.absolute_orbit = int(self.manifest.findall('.//{*}orbitNumber')[0].text)
         self.polarizations = list({x.split('-')[3] for x in self.annotations.keys()})
         self.orbit_direction = self.manifest.findtext('.//{*}pass').lower()
+        self.slc_start_anx = float(self.manifest.findtext('.//{*}startTimeANX'))
         self.n_swaths = len(self.manifest.findall('.//{*}swath'))
 
         self.iw2_mid_range = self.calculate_iw2_mid_range()
@@ -72,7 +74,8 @@ class SwathMetadata:
         self.polarization = polarization
         self.swath_index = swath_index
 
-        attrs = ['safe_url', 'safe_name', 'absolute_orbit', 'relative_orbit', 'orbit_direction', 'iw2_mid_range']
+        attrs = ['safe_url', 'safe_name', 'absolute_orbit', 'relative_orbit', 'orbit_direction', 'iw2_mid_range',
+                 'platform', 'slc_start_anx']
         [setattr(self, x, getattr(slc, x)) for x in attrs]
 
         pattern = f'^.*/s1.-iw{self.swath_index + 1}-slc-{self.polarization.lower()}.*$'
@@ -135,10 +138,10 @@ class BurstMetadata:
     def __init__(self, swath, burst_index):
         self.burst_index = burst_index
         attrs = ['absolute_orbit', 'annotation_path', 'azimuth_time_interval', 'iw2_mid_range', 'measurement_path',
-                 'orbit_direction', 'polarization', 'prf_raw_data', 'radar_center_frequency', 'range_bandwidth',
-                 'range_chirp_rate', 'range_pixel_spacing', 'range_sampling_rate', 'range_window_coefficient',
-                 'range_window_type', 'rank', 'relative_orbit', 'safe_name', 'safe_url', 'slant_range_time',
-                 'starting_range', 'swath_index', 'wavelength']
+                 'orbit_direction', 'platform', 'polarization', 'prf_raw_data', 'radar_center_frequency',
+                 'range_bandwidth', 'range_chirp_rate', 'range_pixel_spacing', 'range_sampling_rate',
+                 'range_window_coefficient', 'range_window_type', 'rank', 'relative_orbit', 'safe_name', 'safe_url',
+                 'slant_range_time', 'slc_start_anx', 'starting_range', 'swath_index', 'wavelength']
         [setattr(self, x, getattr(swath, x)) for x in attrs]
 
         burst_annotations = swath.annotation.findall('.//{*}burst')
@@ -151,7 +154,8 @@ class BurstMetadata:
         self.lines = int(swath.annotation.findtext('.//{*}linesPerBurst'))
         self.samples = int(swath.annotation.findtext('.//{*}samplesPerBurst'))
         self.sensing_start = self.burst_annotation.findtext('.//{*}azimuthTime')
-        self.burst_anx_time = float(self.burst_annotation.find('.//{*}azimuthAnxTime').text)
+        self.burst_anx_delta = float(self.burst_annotation.find('.//{*}azimuthAnxTime').text)
+        self.burst_anx = self.slc_start_anx + self.burst_anx_delta
 
         self.azimuth_frame_rate = self.get_nearest_polynomial(swath.azimuth_frame_rates)
         self.doppler = self.get_nearest_polynomial(swath.dopplers)
@@ -194,7 +198,7 @@ class BurstMetadata:
 
     def calculate_relative_burstid(self):
         orbital = (self.relative_orbit - 1) * NOMINAL_ORBITAL_DURATION
-        time_distance = self.burst_anx_time + orbital
+        time_distance = self.burst_anx_delta + orbital
         relative_burstid = 1 + np.floor((time_distance - PREAMBLE_LENGTH) / BEAM_CYCLE_TIME)
         return int(relative_burstid)
 
@@ -233,6 +237,7 @@ class BurstMetadata:
         return pd.Series(attrib_dict)
 
     def to_stac_item(self):
+        internation_ids = {'S1A': ' 2014-016A', 'S1B': '2016-025A'}
         properties = {'stack_id': self.stack_id}
 
         asset_properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
@@ -244,6 +249,16 @@ class BurstMetadata:
                            bbox=self.bounds,
                            datetime=convert_dt(self.sensing_start),
                            properties=properties)
+
+        ext_sat = sat.SatExtension.ext(item, add_if_missing=True)
+        ext_sat.apply(sat.OrbitState(self.orbit_direction), self.relative_orbit, self.absolute_orbit,
+                      internation_ids[self.platform],
+                      convert_dt(self.sensing_start))
+
+        ext_sar = sar.SarExtension.ext(item, add_if_missing=True)
+        ext_sar.apply('IW', sar.FrequencyBand('C'), [sar.Polarization(self.polarization.upper())], 'SLC-BURST',
+                      self.radar_center_frequency, looks_range=1, looks_azimuth=1,
+                      observation_direction=sar.ObservationDirection('right'))
 
         item.add_asset(key=self.polarization.upper(),
                        asset=pystac.Asset(href=self.safe_url, media_type=pystac.MediaType.GEOTIFF,

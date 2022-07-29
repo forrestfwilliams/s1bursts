@@ -1,6 +1,7 @@
 import os
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
@@ -137,7 +138,8 @@ class SwathMetadata:
 class BurstMetadata:
     def __init__(self, swath, burst_index):
         self.burst_index = burst_index
-        attrs = ['absolute_orbit', 'annotation_path', 'azimuth_time_interval', 'iw2_mid_range', 'measurement_path',
+        attrs = ['absolute_orbit', 'annotation_path', 'azimuth_steer_rate', 'azimuth_time_interval', 'iw2_mid_range',
+                 'measurement_path',
                  'orbit_direction', 'platform', 'polarization', 'prf_raw_data', 'radar_center_frequency',
                  'range_bandwidth', 'range_chirp_rate', 'range_pixel_spacing', 'range_sampling_rate',
                  'range_window_coefficient', 'range_window_type', 'rank', 'relative_orbit', 'safe_name', 'safe_url',
@@ -159,10 +161,11 @@ class BurstMetadata:
 
         self.azimuth_frame_rate = self.get_nearest_polynomial(swath.azimuth_frame_rates)
         self.doppler = self.get_nearest_polynomial(swath.dopplers)
-        self.first_valid_sample, self.last_sample, self.first_valid_line, self.last_line = self.get_lines_and_samples()
+        self.first_valid_sample, self.last_valid_sample, self.first_valid_line, self.last_valid_line = self.get_lines_and_samples()
 
         self.relative_burst_id = self.calculate_relative_burstid()
         self.stack_id = f'{self.relative_burst_id}_IW{self.swath_index + 1}'
+        self.opera_id = f't{self.relative_orbit}_{self.stack_id}'
         self.footprint, self.bounds, self.center = self.create_geometry(swath.gcp_df)
         reformatted_datetime = convert_dt(self.sensing_start).strftime('%Y%m%dT%H%M%S')
         self.absolute_burst_id = f'S1_SLC_{reformatted_datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
@@ -222,14 +225,14 @@ class BurstMetadata:
 
         first_valid_line = [x >= 0 for x in first_valid_samples].index(True)
         n_valid_lines = [x >= 0 for x in first_valid_samples].count(True)
-        last_line = first_valid_line + n_valid_lines - 1
+        last_valid_line = first_valid_line + n_valid_lines - 1
 
         first_valid_sample = max(first_valid_samples[first_valid_line],
-                                 first_valid_samples[last_line])
-        last_sample = min(last_valid_samples[first_valid_line],
-                          last_valid_samples[last_line])
+                                 first_valid_samples[last_valid_line])
+        last_valid_sample = min(last_valid_samples[first_valid_line],
+                                last_valid_samples[last_valid_line])
 
-        return first_valid_sample, last_sample, first_valid_line, last_line,
+        return first_valid_sample, last_valid_sample, first_valid_line, last_valid_line,
 
     def to_series(self):
         attribs = ['absolute_burst_id', 'relative_burst_id', 'datetime', 'footprint']
@@ -238,7 +241,14 @@ class BurstMetadata:
 
     def to_stac_item(self):
         internation_ids = {'S1A': ' 2014-016A', 'S1B': '2016-025A'}
+
         properties = {'stack_id': self.stack_id}
+        for_opera = ['wavelength', 'azimuth_steer_rate', 'azimuth_time_interval', 'slant_range_time', 'starting_range',
+                     'iw2_mid_range', 'range_sampling_rate', 'range_pixel_spacing', 'azimuth_frame_rate', 'doppler',
+                     'range_bandwidth', 'opera_id', 'center', 'burst_index', 'first_valid_sample', 'last_valid_sample',
+                     'first_valid_line', 'last_valid_line', 'range_window_type', 'range_window_coefficient', 'rank',
+                     'prf_raw_data', 'range_chirp_rate']
+        properties = properties | {k: getattr(self, k) for k in for_opera}
 
         asset_properties = {'lines': self.lines, 'samples': self.samples, 'byte_offset': self.byte_offset,
                             'byte_length': self.byte_length,
@@ -283,6 +293,20 @@ def get_netrc_auth():
     username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
     auth = aiohttp.BasicAuth(username, password)
     return auth
+
+
+def local_read_metadata(zip_path):
+    safe_name = Path(zip_path).with_suffix('.SAFE').name
+    manifest_name = f'{safe_name}/manifest.safe'
+    with zipfile.ZipFile(zip_path) as z:
+        manifest = ET.parse(z.extract(manifest_name)).getroot()
+
+        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
+
+        annotation_paths = [x[2:] for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
+        annotation_paths.sort()
+        annotations = {x: ET.parse(z.extract(f'{safe_name}/{x}')).getroot() for x in annotation_paths}
+    return manifest, annotations
 
 
 def edl_download_metadata(safe_url, auth):

@@ -404,9 +404,11 @@ def generate_burst_stac_catalog(burst_list):
             if not item_from_catalog:
                 collection.add_items(stack_items)
             else:
+                collection.remove_item(item_from_catalog.id)
                 item_polarization = item.properties['sar:polarizations'][0]
                 item_from_catalog.add_asset(key=item_polarization, asset=item.assets[item_polarization])
                 item_from_catalog.properties['sar:polarizations'] += [item_polarization]
+                collection.add_item(item_from_catalog)
 
         catalog.add_child(collection)
 

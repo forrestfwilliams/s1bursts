@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
+from itertools import product
 
 import aiohttp
 import fsspec
@@ -172,7 +173,7 @@ class BurstMetadata:
         self.opera_id = f't{self.relative_orbit}_{self.stack_id.lower()}'
         self.footprint, self.bounds, self.center = self.create_geometry(swath.gcp_df)
         reformatted_datetime = convert_dt(self.sensing_start).strftime('%Y%m%dT%H%M%S')
-        self.absolute_burst_id = f'S1_SLC_{reformatted_datetime}_{self.polarization.upper()}_{self.relative_burst_id}_IW{self.swath_index + 1}'
+        self.absolute_burst_id = f'S1_SLC_{reformatted_datetime}_{self.relative_burst_id}_IW{self.swath_index + 1}'
 
     def get_nearest_polynomial(self, time_poly_pair):
         d_seconds = 0.5 * (self.lines - 1) * self.azimuth_time_interval
@@ -367,9 +368,10 @@ def get_burst_metadata(safe_url_list, threads=None):
     for safe_url in safe_url_list:
         manifest, annotations = safe_metadata[safe_url]
         slc = SLCMetadata(safe_url, manifest, annotations)
-        for swath_index in range(0, slc.n_swaths):
-            swath = SwathMetadata(slc, 'vv', swath_index)
-            for burst_index in range(0, swath.n_bursts):
+        polarization_swath = product(slc.polarizations, range(slc.n_swaths))
+        for polarization, swath_index in polarization_swath:
+            swath = SwathMetadata(slc, polarization, swath_index)
+            for burst_index in range(swath.n_bursts):
                 burst = BurstMetadata(swath, burst_index)
                 bursts.append(burst)
 
@@ -377,13 +379,14 @@ def get_burst_metadata(safe_url_list, threads=None):
 
 
 def generate_burst_stac_catalog(burst_list):
-    catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs')
+    catalog = pystac.Catalog(id='burst-catalog', description='A catalog containing Sentinel-1 burst SLCs',
+                             catalog_type=pystac.CatalogType.SELF_CONTAINED)
     burst_items = [x.to_stac_item() for x in burst_list]
-    # catalog.add_items(burst_items)
     stack_ids = set([x.properties['stack_id'] for x in burst_items])
 
     for stack_id in stack_ids:
         stack_items = [x for x in burst_items if x.properties['stack_id'] == stack_id]
+        orbit_direction = stack_items[0].properties['sat:orbit_state']
         footprints = [geometry.Polygon(x.geometry['coordinates'][0]) for x in stack_items]
         datetimes = [x.datetime for x in stack_items]
         footprint = unary_union(footprints)
@@ -394,8 +397,17 @@ def generate_burst_stac_catalog(burst_list):
         collection_extent = pystac.Extent(spatial=spatial_extent, temporal=temporal_extent)
         collection = pystac.Collection(id=stack_id,
                                        description=f'Sentinel-1 Burst Stack {stack_id}',
-                                       extent=collection_extent)
-        collection.add_items(stack_items)
+                                       extent=collection_extent,
+                                       extra_fields={'sat:orbit_state': orbit_direction})
+        for item in stack_items:
+            item_from_catalog = collection.get_item(item.id)
+            if not item_from_catalog:
+                collection.add_items(stack_items)
+            else:
+                item_polarization = item.properties['sar:polarizations'][0]
+                item_from_catalog.add_asset(key=item_polarization, asset=item.assets[item_polarization])
+                item_from_catalog.properties['sar:polarizations'] += [item_polarization]
+
         catalog.add_child(collection)
 
     return catalog

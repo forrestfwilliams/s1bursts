@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import xml.etree.ElementTree as ET
 import zipfile
@@ -13,9 +14,10 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pystac
-from pystac.extensions import sat, sar
 import xarray as xr
 from pqdm.threads import pqdm
+from pystac.extensions import sat, sar
+from remotezip import RemoteZip
 from shapely import geometry, wkt
 from shapely.ops import unary_union
 
@@ -291,10 +293,10 @@ def download_safe_xml(zip_fs, safe_url, interior_path):
     return xml.getroot()
 
 
-def get_netrc_auth():
+def get_netrc_auth(auth_cls=aiohttp.BasicAuth):
     my_netrc = netrc()
     username, _, password = my_netrc.authenticators('urs.earthdata.nasa.gov')
-    auth = aiohttp.BasicAuth(username, password)
+    auth = auth_cls(username, password)
     return auth
 
 
@@ -325,6 +327,28 @@ def edl_download_metadata(safe_url, auth):
         annotation_paths.sort()
 
         annotations = {x: download_safe_xml(safe_zip, safe_url, x) for x in annotation_paths}
+
+    return manifest, annotations
+
+
+def download_safe_xml_remotezip(zip_object, interior_path):
+    xml = ET.parse(zip_object.extract(interior_path)).getroot()
+    # with zip_object.open(interior_path) as f:
+    #     xml = ET.parse(f).getroot()
+    return xml
+
+
+def edl_download_metadata_remotezip(safe_url, auth):
+    safe_name = Path(safe_url.split('/')[-1]).with_suffix('.SAFE').name
+    manifest_path = f'{safe_name}/manifest.safe'
+    with RemoteZip(safe_url, auth=auth) as z:
+        manifest = download_safe_xml_remotezip(z, manifest_path)
+
+        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
+        annotation_paths = [f'{safe_name}/{x[2:]}' for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
+        annotation_paths.sort()
+
+        annotations = {x: download_safe_xml_remotezip(z, x) for x in annotation_paths}
 
     return manifest, annotations
 
@@ -484,7 +508,7 @@ def stac_item_to_opera_burst(item, polarization, orbit_dir):
 
     # platform
     platform = \
-    [k for k in INTERNATIONAL_IDS if INTERNATIONAL_IDS[k] == properties['sat:platform_international_designator']][0]
+        [k for k in INTERNATIONAL_IDS if INTERNATIONAL_IDS[k] == properties['sat:platform_international_designator']][0]
 
     # doppler
     shape = (asset_properties['lines'], asset_properties['samples'])

@@ -8,6 +8,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from netrc import netrc
 from pathlib import Path
 from itertools import product
+from dataclasses import dataclass
 
 import aiohttp
 import fsspec
@@ -15,11 +16,13 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pystac
+import s1reader
 import xarray as xr
 from pqdm.threads import pqdm
 from pystac.extensions import sat, sar
 from shapely import geometry, wkt
 from shapely.ops import unary_union
+from osgeo import gdal
 
 # These constants are from the Sentinel-1 Level 1 Detailed Algorithm Definition PDF
 # MPC Nom: DI-MPC-IPFDPM, MPC Ref: MPC-0307, Issue/Revision: 2/4, Table 9-7
@@ -396,7 +399,7 @@ def burst_bytes_to_numpy(burst_bytes, shape):
     tmp_array = np.frombuffer(burst_bytes, dtype=np.int16).astype(float)
     array = tmp_array.copy()
     array.dtype = 'complex'
-    array = array.reshape(shape)
+    array = array.reshape(shape).astype(np.csingle)
     return array
 
 
@@ -488,7 +491,7 @@ def initiate_stac_catalog_server(port, catalog_dir):
         httpd.serve_forever()
 
 
-def stac_item_to_opera_burst(item, polarization, orbit_dir):
+def stac_item_to_opera_burst(item, polarization, orbit_dir, remote=False):
     import isce3
     import s1reader
     from s1reader import Sentinel1BurstSlc
@@ -541,7 +544,7 @@ def stac_item_to_opera_burst(item, polarization, orbit_dir):
         border=list(item.geometry['coordinates'][0]),
         orbit=orbit,
         orbit_direction=properties['sat:orbit_state'].capitalize(),
-        tiff_path=f'{asset.href}/{asset_properties["interior_path"]}',
+        tiff_path=asset.href,
         i_burst=properties['burst_index'],
         first_valid_sample=properties['first_valid_sample'],
         last_valid_sample=properties['last_valid_sample'],
@@ -551,8 +554,54 @@ def stac_item_to_opera_burst(item, polarization, orbit_dir):
         range_window_coefficient=properties['range_window_coefficient'],
         rank=properties['rank'],
         prf_raw_data=properties['prf_raw_data'],
-        range_chirp_rate=properties['range_chirp_rate']
+        range_chirp_rate=properties['range_chirp_rate'],
     )
 
-    opera_burst = Sentinel1BurstSlc(**args)
+    remote_args = dict(
+        byte_offset=asset_properties['byte_offset'],
+        byte_length=asset_properties['byte_length'],
+        interior_path=asset_properties['interior_path'],
+        url_path=asset.href,
+    )
+
+    if remote:
+        all_args = args | remote_args
+        all_args['tiff_path'] = ''
+        opera_burst = RemoteSentinel1BurstSLC(**all_args)
+    else:
+        opera_burst = Sentinel1BurstSlc(**args)
     return opera_burst
+
+
+# need to change Sentinel1BurstSLC to unfrozen as well
+@dataclass(frozen=False)
+class RemoteSentinel1BurstSLC(s1reader.Sentinel1BurstSlc):
+    byte_offset: int
+    byte_length: int
+    interior_path: str
+    url_path: str
+
+    def edl_download_data(self):
+        auth = get_netrc_auth()
+        storage_options = {'https': {'client_kwargs': {'trust_env': True, 'auth': auth}}}
+
+        http_fs = fsspec.filesystem('https', **storage_options['https'])
+        with http_fs.open(self.url_path) as http_f:
+            zip_fs = fsspec.filesystem('zip', fo=http_f)
+            with zip_fs.open(self.interior_path) as f:
+                f.seek(self.byte_offset)
+                burst_bytes = f.read(self.byte_length)
+
+        return burst_bytes_to_numpy(burst_bytes, self.shape)
+
+    def slc_to_file(self, out_path, fmt='ENVI'):
+        self.tiff_path = out_path
+        array = self.edl_download_data()
+        driver = gdal.GetDriverByName(fmt)
+        n_rows, n_cols = array.shape
+        out_dataset = driver.Create(self.tiff_path, n_cols, n_rows, 1, gdal.GDT_CFloat32)
+        out_dataset.GetRasterBand(1).WriteArray(array)
+        out_dataset = None
+
+    def slc_to_vrt_file(self, out_path):
+        raise NotImplementedError('This method is not valid for Remote SLC objects')

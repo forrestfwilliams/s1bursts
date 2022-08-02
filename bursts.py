@@ -18,7 +18,6 @@ import pystac
 import xarray as xr
 from pqdm.threads import pqdm
 from pystac.extensions import sat, sar
-from remotezip import RemoteZip
 from shapely import geometry, wkt
 from shapely.ops import unary_union
 
@@ -328,28 +327,6 @@ def edl_download_metadata(safe_url, auth):
         annotation_paths.sort()
 
         annotations = {x: download_safe_xml(safe_zip, safe_url, x) for x in annotation_paths}
-
-    return manifest, annotations
-
-
-def download_safe_xml_remotezip(zip_object, interior_path):
-    xml = ET.parse(zip_object.extract(interior_path)).getroot()
-    # with zip_object.open(interior_path) as f:
-    #     xml = ET.parse(f).getroot()
-    return xml
-
-
-def edl_download_metadata_remotezip(safe_url, auth):
-    safe_name = Path(safe_url.split('/')[-1]).with_suffix('.SAFE').name
-    manifest_path = f'{safe_name}/manifest.safe'
-    with RemoteZip(safe_url, auth=auth) as z:
-        manifest = download_safe_xml_remotezip(z, manifest_path)
-
-        file_paths = [x.attrib['href'] for x in manifest.findall('.//fileLocation')]
-        annotation_paths = [f'{safe_name}/{x[2:]}' for x in file_paths if re.search('^\./annotation/s1.*xml$', x)]
-        annotation_paths.sort()
-
-        annotations = {x: download_safe_xml_remotezip(z, x) for x in annotation_paths}
 
     return manifest, annotations
 

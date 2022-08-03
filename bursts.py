@@ -369,7 +369,8 @@ def generate_burst_stac_catalog(burst_list):
         orbit_direction = stack_items[0].properties['sat:orbit_state']
         footprints = [geometry.Polygon(x.geometry['coordinates'][0]) for x in stack_items]
         datetimes = [x.datetime for x in stack_items]
-        footprint = unary_union(footprints)
+        # footprint = unary_union(footprints)
+        footprint = footprints[0]
         date_min, date_max = min(datetimes), max(datetimes)
 
         spatial_extent = pystac.SpatialExtent(list(footprint.bounds))
@@ -463,8 +464,8 @@ def generate_burst_geodataframe(burst_list):
     return gdf
 
 
-def save_stac_catalog_locally(catalog):
-    stac_location = Path('.') / 'stac'
+def save_stac_catalog_locally(catalog, catalog_name):
+    stac_location = Path('.') / catalog_name
     if not stac_location.exists():
         stac_location.mkdir()
     catalog.normalize_hrefs(str(stac_location))

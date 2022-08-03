@@ -10,3 +10,5 @@ pystac
 safe-netrc
 xarray
 zarr
+requests
+shapely

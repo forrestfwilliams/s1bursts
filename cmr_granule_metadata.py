@@ -65,6 +65,8 @@ def generate_umm(slc, burst):
 
     slc_attribute_names = [
         'ASCENDING_DESCENDING',
+        'BEAM_MODE',
+        'BEAM_MODE_TYPE',
         'PATH_NUMBER',
         'SV_POSITION_POST',
         'SV_POSITION_PRE',
@@ -82,6 +84,42 @@ def generate_umm(slc, burst):
     additional_attributes.append(build_attr('ASC_NODE_TIME', burst.sensing_start))
     additional_attributes.append(build_attr('CENTER_LON', polygon.centroid.x))
     additional_attributes.append(build_attr('CENTER_LAT', polygon.centroid.y))
+
+    additional_attributes.append(build_attr('ANNOTATION_PATH', burst.annotation_path))
+    additional_attributes.append(build_attr('AZIMUTH_FRAME_RATE', str(burst.azimuth_frame_rate)))
+    additional_attributes.append(build_attr('AZIMUTH_STEER_RATE', burst.azimuth_steer_rate))
+    additional_attributes.append(build_attr('AZIMUTH_TIME_INTERVAL', burst.azimuth_time_interval))
+    additional_attributes.append(build_attr('BURST_ANX', burst.burst_anx))
+    additional_attributes.append(build_attr('BURST_ANX_DELTA', burst.burst_anx_delta))
+    additional_attributes.append(build_attr('BURST_INDEX', burst.burst_index))
+    additional_attributes.append(build_attr('BYTE_LENGTH', burst.byte_length))
+    additional_attributes.append(build_attr('BYTE_OFFSET', burst.byte_offset))
+    additional_attributes.append(build_attr('DOPPLER', str(burst.doppler)))
+    additional_attributes.append(build_attr('FIRST_VALID_LINE', burst.first_valid_line))
+    additional_attributes.append(build_attr('FIRST_VALID_SAMPLE', burst.first_valid_sample))
+    additional_attributes.append(build_attr('IW2_MID_RANGE', burst.iw2_mid_range))
+    additional_attributes.append(build_attr('LAST_VALID_LINE', burst.last_valid_line))
+    additional_attributes.append(build_attr('LAST_VALID_SAMPLE', burst.last_valid_sample))
+    additional_attributes.append(build_attr('LINES', burst.lines))
+    additional_attributes.append(build_attr('MEASUREMENT_PATH', burst.measurement_path))
+    additional_attributes.append(build_attr('OPERA_ID', burst.opera_id))
+    additional_attributes.append(build_attr('PRF_RAW_DATA', burst.prf_raw_data))
+    additional_attributes.append(build_attr('RADAR_CENTER_FREQUENCY', burst.radar_center_frequency))
+    additional_attributes.append(build_attr('RANGE_BANDWIDTH', burst.range_bandwidth))
+    additional_attributes.append(build_attr('RANGE_CHIRP_RATE', burst.range_chirp_rate))
+    additional_attributes.append(build_attr('RANGE_PIXEL_SPACING', burst.range_pixel_spacing))
+    additional_attributes.append(build_attr('RANGE_SAMPLING_RATE', burst.range_sampling_rate))
+    additional_attributes.append(build_attr('RANGE_WINDOW_COEFFICIENT', burst.range_window_coefficient))
+    additional_attributes.append(build_attr('RANGE_WINDOW_TYPE', burst.range_window_type))
+    additional_attributes.append(build_attr('RANK', burst.rank))
+    additional_attributes.append(build_attr('SAFE_NAME', burst.safe_name))
+    additional_attributes.append(build_attr('SAFE_URL', burst.safe_url))
+    additional_attributes.append(build_attr('SAMPLES', burst.samples))
+    additional_attributes.append(build_attr('SLANT_RANGE_TIME', burst.slant_range_time))
+    additional_attributes.append(build_attr('SLC_START_ANX', burst.slc_start_anx))
+    additional_attributes.append(build_attr('STARTING_RANGE', burst.starting_range))
+    additional_attributes.append(build_attr('SWATH_INDEX', burst.swath_index))
+    additional_attributes.append(build_attr('WAVELENGTH', burst.wavelength))
 
     umm = {
         'TemporalExtent': {
@@ -163,12 +201,12 @@ def generate_umm(slc, burst):
 
 if __name__ == '__main__':
     cmr_slcs = get_galapagos_cmr_slcs()
-    for slc in cmr_slcs:
-        urls = [slc['RelatedUrls'][0]['URL'], ]
-        burst_list = bursts.get_burst_metadata(urls, threads=20)
-        for burst in burst_list:
-            umm = generate_umm(slc, burst)
-            print(umm['GranuleUR'])
-            with open(f'umm/{umm["GranuleUR"]}.json', 'w') as f:
-                json.dump(umm, f, indent=2)
-        break
+    urls = [slc['RelatedUrls'][0]['URL'] for slc in cmr_slcs]
+    burst_list = bursts.get_burst_metadata(urls, threads=20)
+
+    for burst in burst_list:
+        slc = [slc for slc in cmr_slcs if f"{slc['DataGranule']['Identifiers'][0]['Identifier']}.SAFE" == burst.safe_name][0]
+        umm = generate_umm(slc, burst)
+        print(umm['GranuleUR'])
+        with open(f'umm/{umm["GranuleUR"]}.json', 'w') as f:
+            json.dump(umm, f, indent=2)

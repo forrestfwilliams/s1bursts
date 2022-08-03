@@ -43,18 +43,46 @@ def get_galapagos_cmr_slcs():
     return cmr_query(params)
 
 
-def get_attr_values(name, attributes):
-    for attr in attributes:
-        if attr['Name'] == name:
-            return attr['Values']
+def build_attr(name, value):
+    attr = {
+        'Name': name,
+    }
+    if isinstance(value, list):
+        attr['Values'] = [str(v) for v in value]
+    else:
+        attr['Values'] = [str(value)]
+    return attr
 
 
 def generate_umm(slc, burst):
     now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+
     swath = burst.absolute_burst_id.split('_')[-1]
     granule_ur = f'S1_SLC_{burst.sensing_start.split(".")[0].replace("-", "").replace(":", "")}_{burst.polarization.upper()}_{burst.relative_burst_id:06}_{swath}'
+
     points = BURST_MAP[f'{burst.relative_burst_id:06}_{swath}']
     polygon = Polygon([[point['Longitude'], point['Latitude']] for point in points])
+
+    slc_attribute_names = [
+        'ASCENDING_DESCENDING',
+        'PATH_NUMBER',
+        'SV_POSITION_POST',
+        'SV_POSITION_PRE',
+        'SV_VELOCITY_POST',
+        'SV_VELOCITY_PRE',
+        'LOOK_DIRECTION',
+    ]
+    additional_attributes = [attr for attr in slc['AdditionalAttributes'] if attr['Name'] in slc_attribute_names]
+
+    additional_attributes.append(build_attr('PROCESSING_TYPE', 'S1_SLC_BURSTS'))
+    additional_attributes.append(build_attr('GROUP_ID', granule_ur))
+    additional_attributes.append(build_attr('POLARIZATION', burst.polarization.upper()))
+    additional_attributes.append(build_attr('RELATIVE_BURST_ID', burst.relative_burst_id))
+    additional_attributes.append(build_attr('SWATH', swath))
+    additional_attributes.append(build_attr('ASC_NODE_TIME', burst.sensing_start))
+    additional_attributes.append(build_attr('CENTER_LON', polygon.centroid.x))
+    additional_attributes.append(build_attr('CENTER_LAT', polygon.centroid.y))
+
     umm = {
         'TemporalExtent': {
             'RangeDateTime': {
@@ -64,92 +92,7 @@ def generate_umm(slc, burst):
         },
         'OrbitCalculatedSpatialDomains': slc['OrbitCalculatedSpatialDomains'],
         'GranuleUR': granule_ur,
-        'AdditionalAttributes': [
-            {
-                'Name': 'GROUP_ID',
-                'Values': [
-                    granule_ur,
-                ],
-            },
-            {
-                'Name': 'PROCESSING_TYPE',
-                'Values': [
-                    'S1_SLC_BURSTS',
-                ],
-            },
-            {
-                'Name': 'POLARIZATION',
-                'Values': [
-                    burst.polarization.upper(),
-                ],
-            },
-            {
-                'Name': 'BEAM_MODE',
-                'Values': get_attr_values('BEAM_MODE', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'BEAM_MODE_TYPE',
-                'Values': get_attr_values('BEAM_MODE_TYPE', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'ASCENDING_DESCENDING',
-                'Values': get_attr_values('ASCENDING_DESCENDING', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'PATH_NUMBER',
-                'Values': get_attr_values('PATH_NUMBER', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'RELATIVE_BURST_ID',
-                'Values': [
-                    str(burst.relative_burst_id),
-                ],
-            },
-            {
-                'Name': 'SWATH',
-                'Values': [
-                    swath,
-                ],
-            },
-            {
-                'Name': 'SV_POSITION_POST',
-                'Values': get_attr_values('SV_POSITION_POST', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'SV_POSITION_PRE',
-                'Values': get_attr_values('SV_POSITION_PRE', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'SV_VELOCITY_POST',
-                'Values': get_attr_values('SV_VELOCITY_POST', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'SV_VELOCITY_PRE',
-                'Values': get_attr_values('SV_VELOCITY_PRE', slc['AdditionalAttributes']),
-            },
-            {
-                'Name': 'ASC_NODE_TIME',
-                'Values': [
-                    burst.sensing_start,
-                ],
-            },
-            {
-                'Name': 'CENTER_LON',
-                'Values': [
-                    str(polygon.centroid.x),
-                ],
-            },
-            {
-                'Name': 'CENTER_LAT',
-                'Values': [
-                    str(polygon.centroid.y),
-                ],
-            },
-            {
-                'Name': 'LOOK_DIRECTION',
-                'Values': get_attr_values('LOOK_DIRECTION', slc['AdditionalAttributes']),
-            },
-        ],
+        'AdditionalAttributes': additional_attributes,
         'SpatialExtent': {
             'HorizontalSpatialDomain': {
                 'Geometry': {

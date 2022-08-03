@@ -17,6 +17,9 @@ import numpy as np
 import pandas as pd
 import pystac
 import s1reader
+import isce3
+import requests
+import json
 import xarray as xr
 from pqdm.threads import pqdm
 from pystac.extensions import sat, sar
@@ -31,6 +34,8 @@ PREAMBLE_LENGTH = 2.299849
 BEAM_CYCLE_TIME = 2.758273
 SPEED_OF_LIGHT = 299792458.0
 INTERNATIONAL_IDS = {'S1A': ' 2014-016A', 'S1B': '2016-025A'}
+SCIHUB_USER = 'gnssguest'
+SCIHUB_PASSWORD = 'gnssguest'
 
 
 def convert_dt(dt_object):
@@ -492,6 +497,90 @@ def initiate_stac_catalog_server(port, catalog_dir):
         httpd.serve_forever()
 
 
+def cmr_to_opera_burst(cmr_url, remote=False):
+    burst_response = json.loads(requests.get(cmr_url).content)['items'][0]
+    properties = attribute_dict = {x['Name']: x['Values'][0] for x in burst_response['umm']['AdditionalAttributes']}
+    sensing_start = datetime.fromisoformat(
+        burst_response['umm']['TemporalExtent']['RangeDateTime']['BeginningDateTime']).replace(tzinfo=None)
+    shape = (int(properties['LINES']), int(properties['SAMPLES']))
+    center = (float(properties['CENTER_LON']), float(properties['CENTER_LAT']))
+
+    # boundary
+    point_dict = \
+        burst_response['umm']['SpatialExtent']['HorizontalSpatialDomain']['Geometry']['GPolygons'][0]['Boundary']['Points']
+    border = [[x['Longitude'], x['Latitude']] for x in point_dict]
+
+    # doppler
+    doppler_poly1d = isce3.core.Poly1d(*json.loads(properties['DOPPLER']))
+    doppler_lut2d = s1reader.s1_reader.doppler_poly1d_to_lut2d(doppler_poly1d,
+                                                               float(properties['STARTING_RANGE']),
+                                                               float(properties['RANGE_PIXEL_SPACING']),
+                                                               shape,
+                                                               float(properties['AZIMUTH_TIME_INTERVAL']))
+    doppler = s1reader.s1_burst_slc.Doppler(doppler_poly1d, doppler_lut2d)
+
+    # orbit
+    sensor_id, _, start_time, end_time, _ = s1reader.s1_orbit.parse_safe_filename(properties['SAFE_NAME'])
+    orbit_dict = s1reader.s1_orbit.get_orbit_dict(sensor_id, start_time, end_time, 'AUX_POEORB')
+    if orbit_dict is None:
+        orbit_dict = s1reader.s1_orbit.get_orbit_dict(sensor_id, start_time, end_time, 'AUX_RESORB')
+
+    response = requests.get(url=orbit_dict['orbit_url'], auth=(SCIHUB_USER, SCIHUB_PASSWORD))
+    osv_list = ET.fromstring(response.content).find('Data_Block/List_of_OSVs')
+    sensing_duration = timedelta(seconds=shape[0] * float(properties['AZIMUTH_TIME_INTERVAL']))
+    orbit = s1reader.s1_reader.get_burst_orbit(sensing_start, sensing_start + sensing_duration, osv_list)
+
+    args = dict(
+        sensing_start=sensing_start,
+        radar_center_frequency=float(properties['RADAR_CENTER_FREQUENCY']),
+        wavelength=float(properties['WAVELENGTH']),
+        azimuth_steer_rate=float(properties['AZIMUTH_STEER_RATE']),
+        azimuth_time_interval=float(properties['AZIMUTH_TIME_INTERVAL']),
+        slant_range_time=float(properties['SLANT_RANGE_TIME']),
+        starting_range=float(properties['STARTING_RANGE']),
+        iw2_mid_range=float(properties['IW2_MID_RANGE']),
+        range_sampling_rate=float(properties['RANGE_SAMPLING_RATE']),
+        range_pixel_spacing=float(properties['RANGE_PIXEL_SPACING']),
+        shape=shape,
+        azimuth_fm_rate=isce3.core.Poly1d(*json.loads(properties['AZIMUTH_FRAME_RATE'])),
+        doppler=doppler,
+        range_bandwidth=float(properties['RANGE_BANDWIDTH']),
+        polarization=properties['POLARIZATION'],
+        burst_id=properties['OPERA_ID'],
+        platform_id=properties['SAFE_NAME'][:3],
+        center=center,
+        border=border,
+        orbit=orbit,
+        orbit_direction=properties['ASCENDING_DESCENDING'],
+        tiff_path='',
+        i_burst=int(properties['BURST_INDEX']),
+        first_valid_sample=int(properties['FIRST_VALID_SAMPLE']),
+        last_valid_sample=int(properties['LAST_VALID_SAMPLE']),
+        first_valid_line=int(properties['FIRST_VALID_LINE']),
+        last_valid_line=int(properties['LAST_VALID_LINE']),
+        range_window_type=properties['RANGE_WINDOW_TYPE'].capitalize(),
+        range_window_coefficient=float(properties['RANGE_WINDOW_COEFFICIENT']),
+        rank=int(properties['RANK']),
+        prf_raw_data=float(properties['PRF_RAW_DATA']),
+        range_chirp_rate=float(properties['RANGE_CHIRP_RATE']),
+    )
+
+    remote_args = dict(
+        absolute_id=properties['GROUP_ID'],
+        byte_offset=int(properties['BYTE_OFFSET']),
+        byte_length=int(properties['BYTE_LENGTH']),
+        interior_path=f'{properties["SAFE_NAME"]}/{properties["MEASUREMENT_PATH"]}',
+        url_path=properties['SAFE_URL'],
+    )
+
+    if remote:
+        all_args = args | remote_args
+        opera_burst = RemoteSentinel1BurstSLC(**all_args)
+    else:
+        opera_burst = s1reader.Sentinel1BurstSlc(**args)
+    return opera_burst
+
+
 def stac_item_to_opera_burst(item, polarization, orbit_dir, remote=False):
     import isce3
     import s1reader
@@ -577,6 +666,7 @@ def stac_item_to_opera_burst(item, polarization, orbit_dir, remote=False):
 # need to change Sentinel1BurstSLC to unfrozen as well
 @dataclass(frozen=False)
 class RemoteSentinel1BurstSLC(s1reader.Sentinel1BurstSlc):
+    absolute_id: str
     byte_offset: int
     byte_length: int
     interior_path: str
@@ -595,8 +685,16 @@ class RemoteSentinel1BurstSLC(s1reader.Sentinel1BurstSlc):
 
         return burst_bytes_to_numpy(burst_bytes, self.shape)
 
-    def slc_to_file(self, out_path, fmt='ENVI'):
-        self.tiff_path = out_path
+    def slc_to_file(self, out_dir, fmt='ENVI'):
+        if not isinstance(out_dir, Path):
+            out_dir = Path(out_dir)
+
+        if not out_dir.exists():
+            out_dir.mkdir()
+
+        suffix = 'tiff' if fmt == 'GTiff' else 'slc'
+        tiff_path = out_dir / f'{self.absolute_id}.{suffix}'
+        self.tiff_path = str(tiff_path)
         array = self.edl_download_data()
         driver = gdal.GetDriverByName(fmt)
         n_rows, n_cols = array.shape

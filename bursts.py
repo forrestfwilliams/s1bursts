@@ -507,7 +507,8 @@ def cmr_to_opera_burst(cmr_url, remote=False):
 
     # boundary
     point_dict = \
-        burst_response['umm']['SpatialExtent']['HorizontalSpatialDomain']['Geometry']['GPolygons'][0]['Boundary']['Points']
+        burst_response['umm']['SpatialExtent']['HorizontalSpatialDomain']['Geometry']['GPolygons'][0]['Boundary'][
+            'Points']
     border = [[x['Longitude'], x['Latitude']] for x in point_dict]
 
     # doppler
@@ -696,3 +697,87 @@ class RemoteSentinel1BurstSLC(s1reader.Sentinel1BurstSlc):
 
     def slc_to_vrt_file(self, out_path):
         raise NotImplementedError('This method is not valid for Remote SLC objects')
+
+
+def georeference_burst(burst_instance, dem_path, output_dir, scratch_dir):
+    from compass.utils.geo_grid import generate_geogrids
+    # set options
+    threshold = 1e-08
+    iters = 25
+    blocksize = 1000
+    flatten = True
+    output_format = 'GTiff'
+    geocoding_dict = dict(output_format='GTiff',
+                          flatten=True,
+                          lines_per_block=1000,
+                          output_epsg=None,
+                          x_posting=None,
+                          y_posting=None,
+                          x_snap=None,
+                          y_snap=None,
+                          top_left=dict(x=None, y=None),
+                          bottom_right=dict(x=None, y=None))
+    geogrids = generate_geogrids([burst_instance], geocoding_dict, dem_path)
+
+    # prep data
+    date_str = burst_instance.sensing_start.strftime("%Y%m%d")
+    burst_id = burst_instance.burst_id
+    pol = burst_instance.polarization
+    geo_grid = geogrids[burst_id]
+
+    # make dirs
+    os.makedirs(output_dir, exist_ok=True)
+    scratch_path = f'{scratch_dir}/{burst_id}/{date_str}'
+    os.makedirs(scratch_path, exist_ok=True)
+
+    temp_slc_path = f'{scratch_dir}/{burst_id}_{pol}_temp.slc'
+    burst_instance.slc_to_file(temp_slc_path)
+    rdr_burst_raster = isce3.io.Raster(temp_slc_path)
+    print('data downloaded...')
+
+    # Run Geo-referencing
+    dem_raster = isce3.io.Raster(dem_path)
+    epsg = dem_raster.get_epsg()
+    proj = isce3.core.make_projection(epsg)
+    ellipsoid = proj.ellipsoid
+    image_grid_doppler = isce3.core.LUT2d()
+
+    radar_grid = burst_instance.as_isce3_radargrid()
+    native_doppler = burst_instance.doppler.lut2d
+    orbit = burst_instance.orbit
+
+    # Get azimuth polynomial coefficients for this burst
+    az_carrier_poly2d = burst_instance.get_az_carrier_poly()
+
+    # Generate output geocoded burst raster
+    out_name = f'{output_dir}/{burst_id}_{date_str}_{pol}.tif'
+    geo_burst_raster = isce3.io.Raster(
+        out_name,
+        geo_grid.width, geo_grid.length,
+        rdr_burst_raster.num_bands, gdal.GDT_CFloat32, output_format)
+
+    # Extract burst boundaries
+    b_bounds = np.s_[burst_instance.first_valid_line:burst_instance.last_valid_line,
+               burst_instance.first_valid_sample:burst_instance.last_valid_sample]
+
+    # Create sliced radar grid representing valid region of the burst
+    sliced_radar_grid = burst_instance.as_isce3_radargrid()[b_bounds]
+
+    # Geocode
+    isce3.geocode.geocode_slc(geo_burst_raster, rdr_burst_raster,
+                              dem_raster,
+                              radar_grid, sliced_radar_grid,
+                              geo_grid, orbit,
+                              native_doppler,
+                              image_grid_doppler, ellipsoid, threshold,
+                              iters, blocksize, flatten,
+                              azimuth_carrier=az_carrier_poly2d)
+
+    # Set geo transformation
+    geotransform = [geo_grid.start_x, geo_grid.spacing_x, 0,
+                    geo_grid.start_y, 0, geo_grid.spacing_y]
+    geo_burst_raster.set_geotransform(geotransform)
+    geo_burst_raster.set_epsg(epsg)
+    del geo_burst_raster
+    print('geo-referenced!')
+    return out_name

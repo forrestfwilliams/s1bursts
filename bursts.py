@@ -503,7 +503,7 @@ def cmr_to_opera_burst(cmr_url, remote=False):
     sensing_start = datetime.fromisoformat(
         burst_response['umm']['TemporalExtent']['RangeDateTime']['BeginningDateTime']).replace(tzinfo=None)
     shape = (int(properties['LINES']), int(properties['SAMPLES']))
-    center = (float(properties['CENTER_LON']), float(properties['CENTER_LAT']))
+    center = geometry.Point(float(properties['CENTER_LON']), float(properties['CENTER_LAT']))
 
     # boundary
     point_dict = \
@@ -630,7 +630,7 @@ def stac_item_to_opera_burst(item, polarization, orbit_dir, remote=False):
         polarization=polarization,
         burst_id=properties['opera_id'],
         platform_id=platform,
-        center=properties['center'],
+        center=geometry.Point(properties['center']),
         border=list(item.geometry['coordinates'][0]),
         orbit=orbit,
         orbit_direction=properties['sat:orbit_state'].capitalize(),
@@ -685,16 +685,8 @@ class RemoteSentinel1BurstSLC(s1reader.Sentinel1BurstSlc):
 
         return burst_bytes_to_numpy(burst_bytes, self.shape)
 
-    def slc_to_file(self, out_dir, fmt='ENVI'):
-        if not isinstance(out_dir, Path):
-            out_dir = Path(out_dir)
-
-        if not out_dir.exists():
-            out_dir.mkdir()
-
-        suffix = 'tiff' if fmt == 'GTiff' else 'slc'
-        tiff_path = out_dir / f'{self.absolute_id}.{suffix}'
-        self.tiff_path = str(tiff_path)
+    def slc_to_file(self, out_path, fmt='ENVI'):
+        self.tiff_path = str(out_path)
         array = self.edl_download_data()
         driver = gdal.GetDriverByName(fmt)
         n_rows, n_cols = array.shape

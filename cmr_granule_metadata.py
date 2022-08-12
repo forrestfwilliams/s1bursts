@@ -4,7 +4,7 @@ import json
 import requests
 from shapely.geometry import Polygon
 
-import bursts
+import s1bursts
 
 
 with open('burst_locations_by_id.json') as f:
@@ -202,7 +202,7 @@ def generate_umm(slc, burst):
 if __name__ == '__main__':
     cmr_slcs = get_galapagos_cmr_slcs()
     urls = [slc['RelatedUrls'][0]['URL'] for slc in cmr_slcs]
-    burst_list = bursts.get_burst_metadata(urls, threads=20)
+    burst_list = s1bursts.get_burst_metadata(urls, threads=20)
 
     for burst in burst_list:
         slc = [slc for slc in cmr_slcs if f"{slc['DataGranule']['Identifiers'][0]['Identifier']}.SAFE" == burst.safe_name][0]
